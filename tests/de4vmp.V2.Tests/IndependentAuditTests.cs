@@ -1496,7 +1496,7 @@ public sealed class IndependentAuditTests {
 
         // Build CLI into an isolated temp output directory if not already built
         string cliOutDir = Path.Combine(workDir, "cli-build");
-        var buildRes = RunProcess("dotnet", ["build", cliProj, "-c", "Release", "-o", cliOutDir, "--nologo"]);
+        var buildRes = RunProcess("dotnet", ["build", cliProj, "-c", "Release", "-o", cliOutDir, "--nologo", "-nr:false", "-p:UseSharedCompilation=false"]);
         Assert.True(buildRes.ExitCode == 0, $"Failed to build CLI:\nSTDOUT:\n{buildRes.StdOut}\nSTDERR:\n{buildRes.StdErr}");
 
         string builtExe = Path.Combine(cliOutDir, exeName);
@@ -1528,10 +1528,14 @@ public sealed class IndependentAuditTests {
             psi.ArgumentList.Add(a);
 
         using var proc = Process.Start(psi)!;
-        string stdout = proc.StandardOutput.ReadToEnd();
-        string stderr = proc.StandardError.ReadToEnd();
-        Assert.True(proc.WaitForExit(60_000), $"Process '{fileName}' timed out.");
-        return (proc.ExitCode, stdout, stderr);
+        var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+        var stderrTask = proc.StandardError.ReadToEndAsync();
+        bool exited = proc.WaitForExit(60_000);
+        if (!exited) {
+            try { proc.Kill(entireProcessTree: true); } catch { }
+            Assert.Fail($"Process '{fileName}' timed out.");
+        }
+        return (proc.ExitCode, stdoutTask.GetAwaiter().GetResult(), stderrTask.GetAwaiter().GetResult());
     }
 
     private static string CreateTempDir(string tag) {

@@ -28,9 +28,11 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      - name: Restore V2 projects
+      - name: Restore & build solution (Release)
         shell: pwsh
-        run: dotnet restore tests/de4vmp.V2.Tests/de4vmp.V2.Tests.csproj
+        run: |
+          dotnet restore de4vmp.sln
+          dotnet build de4vmp.sln -c Release --no-restore
 
       - name: Install dotnet-ilverify
         shell: pwsh
@@ -42,4 +44,4 @@ jobs:
         shell: pwsh
         env:
           DE4VMP_REQUIRE_ILVERIFY: "1"
-        run: dotnet test tests/de4vmp.V2.Tests/de4vmp.V2.Tests.csproj -c Release --no-restore --verbosity normal
+        run: dotnet test tests/de4vmp.V2.Tests/de4vmp.V2.Tests.csproj -c Release --no-build --verbosity normal
