@@ -7,6 +7,10 @@ on:
         description: 'Publish output and logs as public artifacts (only if authorized to share)'
         type: boolean
         default: false
+      require_devirtualized_output:
+        description: 'Fail the workflow if de4vmp reports an unsupported target (exit code 3)'
+        type: boolean
+        default: false
   push:
     branches: [master]
     paths:
@@ -78,15 +82,34 @@ jobs:
           $validOutput = (Test-Path -LiteralPath $outputPath -PathType Leaf) -and ((Get-Item -LiteralPath $outputPath).Length -gt 0)
           if ($code -eq 0 -and -not $validOutput) { $code = 1 }
           if ($code -ne 0) { Remove-Item -LiteralPath $outputPath -ErrorAction SilentlyContinue }
+          $strictOutput = ('${{ github.event_name }}' -eq 'workflow_dispatch') -and ('${{ inputs.require_devirtualized_output }}' -eq 'true')
+          $status = switch ($code) {
+            0 { 'devirtualized' }
+            3 { 'unsupported_target' }
+            124 { 'timeout' }
+            default { 'error' }
+          }
           $report = @{
+            status = $status
             exit_code = $code
             input_sha256 = (Get-FileHash -LiteralPath $inputPath -Algorithm SHA256).Hash
             output_created = ($code -eq 0)
             output_sha256 = $(if ($code -eq 0) { (Get-FileHash -LiteralPath $outputPath -Algorithm SHA256).Hash } else { $null })
           }
           $report | ConvertTo-Json | Set-Content (Join-Path $outDir 'status.json')
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value @("## Sample processing", "Exit code: $code", "Output created: $($report.output_created)", "Public results require explicit manual opt-in.")
-          if ($code -ne 0) { throw "Tool exited with code $code." }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value @(
+            "## Sample processing",
+            "Status: $status",
+            "Exit code: $code",
+            "Output created: $($report.output_created)",
+            "Note: de4vmp targets VMProtect .NET 3.4/3.5; exit code 3 indicates an unsupported target.",
+            "Public results require explicit manual opt-in."
+          )
+          if ($code -eq 3 -and -not $strictOutput) {
+            Write-Warning 'de4vmp exited with code 3 (unsupported VMProtect target; de4vmp supports VMProtect .NET 3.4/3.5).'
+          } elseif ($code -ne 0) {
+            throw "Tool exited with code $code."
+          }
 
       - name: Upload status
         if: ${{ always() }}
