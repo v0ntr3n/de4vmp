@@ -1,0 +1,37 @@
+name: V2 Synthetic Benchmarks (.NET 8)
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  v2-benchmarks:
+    name: Build & Verify V2 Synthetic Tiers 1-4
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore V2 projects
+        shell: pwsh
+        run: dotnet restore tests/de4vmp.V2.Tests/de4vmp.V2.Tests.csproj
+
+      - name: Run V2 synthetic benchmark & fail-closed verification tests
+        shell: pwsh
+        run: dotnet test tests/de4vmp.V2.Tests/de4vmp.V2.Tests.csproj -c Release --no-restore --verbosity normal
