@@ -1,0 +1,79 @@
+name: Process authorized input (private storage)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  process:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '7.0.x'
+      - name: Build tool
+        shell: pwsh
+        run: |
+          dotnet publish de4vmp/de4vmp.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish/win-x64
+          if ($LASTEXITCODE -ne 0) { throw 'Publish failed.' }
+      - name: Retrieve authorized fixture from private release
+        id: fetch
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_INPUT_TOKEN }}
+          STORAGE_REPO: ${{ secrets.PRIVATE_INPUT_REPO }}
+          RELEASE_TAG: ${{ secrets.PRIVATE_INPUT_TAG }}
+          INPUT_ASSET: ${{ secrets.PRIVATE_INPUT_ASSET }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:GH_TOKEN -or $env:STORAGE_REPO -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' -or -not $env:RELEASE_TAG -or $env:INPUT_ASSET -notmatch '^[A-Za-z0-9_.-]+\.(exe|dll)$') {
+            throw 'Configure the four private input secrets before running.'
+          }
+          $isPrivate = gh api "repos/$env:STORAGE_REPO" --jq '.private' 2>$null
+          if ($LASTEXITCODE -ne 0 -or "$isPrivate" -ne 'true') { throw 'Storage repository must be private and accessible.' }
+          $inDir = Join-Path $env:RUNNER_TEMP 'authorized-input'
+          New-Item -ItemType Directory -Path $inDir -Force | Out-Null
+          $assetPath = Join-Path $inDir 'input.bin'
+          gh release download "$env:RELEASE_TAG" --repo "$env:STORAGE_REPO" --pattern "$env:INPUT_ASSET" --output "$assetPath" *> $null
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $assetPath -PathType Leaf)) { throw 'Private input download failed.' }
+      - name: Process input as data (do not execute input)
+        id: process
+        shell: pwsh
+        run: |
+          $outDir = Join-Path $env:RUNNER_TEMP 'private-results'
+          New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+          $inputPath = Join-Path $env:RUNNER_TEMP 'authorized-input/input.bin'
+          $outputPath = Join-Path $outDir 'result.bin'
+          $tool = (Resolve-Path 'publish/win-x64/de4vmp.exe').Path
+          $p = Start-Process -FilePath $tool -ArgumentList @('--ci','--no-banner','--timeout','1800','--input',('"' + $inputPath + '"'),'--output',('"' + $outputPath + '"')) -RedirectStandardOutput (Join-Path $outDir 'stdout.log') -RedirectStandardError (Join-Path $outDir 'stderr.log') -NoNewWindow -PassThru
+          if (-not $p.WaitForExit(1860000)) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            $code = 124
+          } else { $code = $p.ExitCode }
+          if ($code -eq 0 -and -not (Test-Path -LiteralPath $outputPath -PathType Leaf)) { $code = 1 }
+          if ($code -ne 0) { Remove-Item -LiteralPath $outputPath -ErrorAction SilentlyContinue }
+          @{ exit_code = $code; run_id = $env:GITHUB_RUN_ID; input_sha256 = (Get-FileHash -LiteralPath $inputPath -Algorithm SHA256).Hash } | ConvertTo-Json | Set-Content (Join-Path $outDir 'status.json')
+          if ($code -ne 0) { throw "Tool exited with code $code. Diagnostics will be sent to private storage." }
+      - name: Upload results only to private release
+        if: ${{ always() && steps.fetch.outcome == 'success' && (steps.process.outcome == 'success' || steps.process.outcome == 'failure') }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_INPUT_TOKEN }}
+          STORAGE_REPO: ${{ secrets.PRIVATE_INPUT_REPO }}
+          RELEASE_TAG: ${{ secrets.PRIVATE_INPUT_TAG }}
+        run: |
+          $isPrivate = gh api "repos/$env:STORAGE_REPO" --jq '.private' 2>$null
+          if ($LASTEXITCODE -ne 0 -or "$isPrivate" -ne 'true') { throw 'Refusing to upload outside private storage.' }
+          $outDir = Join-Path $env:RUNNER_TEMP 'private-results'
+          if (-not (Test-Path -LiteralPath $outDir)) { throw 'No diagnostic directory.' }
+          $zip = Join-Path $env:RUNNER_TEMP "results-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.zip"
+          Compress-Archive -Path "$outDir/*" -DestinationPath $zip -Force
+          gh release upload "$env:RELEASE_TAG" "$zip" --repo "$env:STORAGE_REPO" *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Private result upload failed.' }
+          Write-Host 'Results sent to private storage.'
