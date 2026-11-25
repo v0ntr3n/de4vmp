@@ -51,6 +51,10 @@ jobs:
         shell: pwsh
         run: dotnet build de4vmp.sln -c Release --no-restore
 
+      - name: Run function discovery tests
+        shell: pwsh
+        run: dotnet test tests/de4vmp.Tests/de4vmp.Tests.csproj -c Release
+
       - name: Publish self-contained Windows x64 executable
         shell: pwsh
         run: |
