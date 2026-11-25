@@ -14,15 +14,22 @@ public class DevirtualizationContext {
     
     private readonly IDictionary<byte, HandlerBase> _handlers = new Dictionary<byte, HandlerBase>();
 
-    public DevirtualizationContext(IReadOnlyList<string> args) {
-        if (args.Count != 1)
-            throw new ArgumentException("Invalid arguments, please specify path to target.");
+    public DevirtualizationContext(IReadOnlyList<string> args)
+        : this(ValidateSingleArg(args), null) {
+    }
 
-        string filePath = Path.GetFullPath(args[0]);
+    public DevirtualizationContext(string inputPath, string? outputPath = null) {
+        if (string.IsNullOrWhiteSpace(inputPath))
+            throw new ArgumentException("Invalid arguments, please specify path to target.", nameof(inputPath));
+
+        string filePath = Path.GetFullPath(inputPath);
         if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
-            throw new ArgumentException("Invalid path, please make sure your input is correct.");
+            throw new ArgumentException($"Invalid path, file does not exist: {inputPath}", nameof(inputPath));
 
-        PeFile = PEFile.FromFile(args[0]);
+        InputPath = filePath;
+        OutputPath = string.IsNullOrWhiteSpace(outputPath) ? null : Path.GetFullPath(outputPath);
+
+        PeFile = PEFile.FromFile(filePath);
         var dataDirectory = PeFile.OptionalHeader.DataDirectories[(short)DataDirectoryIndex.ClrDirectory];
         if (!dataDirectory.IsPresentInPE)
             throw new ArgumentException("PEFile does not have dotnet metadata! This devirtualizer is for .NET!");
@@ -33,6 +40,13 @@ public class DevirtualizationContext {
 
         var readerParameters = new ModuleReaderParameters(workingDirectory, EmptyErrorListener.Instance);
         Module = ModuleDefinition.FromFile(PeFile, readerParameters);
+    }
+
+    private static string ValidateSingleArg(IReadOnlyList<string> args) {
+        if (args.Count != 1)
+            throw new ArgumentException("Invalid arguments, please specify path to target.");
+
+        return args[0];
     }
     
     public void ImportFunction(VmpFunction function) {
@@ -56,6 +70,10 @@ public class DevirtualizationContext {
     public bool TryLookupHandler(byte opCodeValue, out HandlerBase handler) {
         return _handlers.TryGetValue(opCodeValue, out handler!);
     }
+
+    public string InputPath { get; }
+
+    public string? OutputPath { get; }
 
     public PEFile PeFile { get; }
 

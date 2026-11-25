@@ -21,17 +21,19 @@ public class Devirtualizer {
          };
     }
     
-    public void Devirtualize(DevirtualizationContext context) {
+    public void Devirtualize(DevirtualizationContext context, CancellationToken cancellationToken = default) {
         _logger.Debug(this, $"Imported target {context.Module}");
 
         foreach (var phase in _phases) {
+            cancellationToken.ThrowIfCancellationRequested();
             phase.Run(_logger, context);
         }
 
-        SaveModule(context.Module);
+        cancellationToken.ThrowIfCancellationRequested();
+        SaveModule(context.Module, context.OutputPath);
     }
 
-    private void SaveModule(ModuleDefinition moduleDefinition) {
+    private void SaveModule(ModuleDefinition moduleDefinition, string? customOutputPath = null) {
         _logger.Information(this, "Attempting to rebuild module...");
 
         var builder = new ManagedPEImageBuilder {
@@ -56,8 +58,14 @@ public class Devirtualizer {
                 new BadImageFormatException(moduleDefinition.Name));
 
         string? path = moduleDefinition.FilePath;
-        string filePath = Path.Combine(Path.GetDirectoryName(path) ?? string.Empty,
-            $"{Path.GetFileNameWithoutExtension(path)}_devirtualized{Path.GetExtension(path)}");
+        string filePath = !string.IsNullOrWhiteSpace(customOutputPath)
+            ? customOutputPath
+            : Path.Combine(Path.GetDirectoryName(path) ?? string.Empty,
+                $"{Path.GetFileNameWithoutExtension(path)}_devirtualized{Path.GetExtension(path)}");
+
+        string? outputDir = Path.GetDirectoryName(filePath);
+        if (!string.IsNullOrEmpty(outputDir) && !Directory.Exists(outputDir))
+            Directory.CreateDirectory(outputDir);
 
         var fileBuilder = new ManagedPEFileBuilder();
         var file = fileBuilder.CreateFile(builderResult.ConstructedImage);
