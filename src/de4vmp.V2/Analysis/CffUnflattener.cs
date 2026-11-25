@@ -87,6 +87,10 @@ public sealed class CffUnflattener {
             if (!isMod2 && !isAnd1)
                 continue;
 
+            // Never rewrite if any branch targets an interior instruction of the opaque predicate sequence.
+            if (HasBranchTargetInRange(insns, i + 1, i + 7, -1))
+                continue;
+
             var branch = insns[i + 7];
             if (branch.OpCode.Code == CilCode.Brfalse) {
                 // Result is always 0 -> brfalse is ALWAYS taken
@@ -141,7 +145,7 @@ public sealed class CffUnflattener {
                 dispatcherStart = i - 3;
                 indexTransform = op switch {
                     CilCode.Xor => x => x ^ k,
-                    CilCode.Rem => x => k != 0 ? x % k : -1,
+                    CilCode.Rem => x => (k != 0 && !(x == int.MinValue && k == -1)) ? x % k : -1,
                     CilCode.Rem_Un => x => k != 0 ? (int)((uint)x % (uint)k) : -1,
                     CilCode.And => x => x & k,
                     _ => x => x
@@ -241,6 +245,7 @@ public sealed class CffUnflattener {
                 insns.Insert(dispatcherStart, new CilInstruction(CilOpCodes.Br, targetInsn.CreateLabel()));
                 dispatcherStart++;
                 switchIdx++;
+                insns.CalculateOffsets();
             }
 
             rewired++;
@@ -254,15 +259,22 @@ public sealed class CffUnflattener {
         bool dispatcherStillReferenced = dispatcherStart == 0;
         if (!dispatcherStillReferenced) {
             int prevIdx = dispatcherStart - 1;
-            while (prevIdx >= 0 && insns[prevIdx].OpCode.Code == CilCode.Nop)
-                prevIdx--;
-            if (prevIdx < 0) {
-                dispatcherStillReferenced = true;
-            }
-            else {
-                var prevFlow = insns[prevIdx].OpCode.FlowControl;
-                if (prevFlow is CilFlowControl.Next or CilFlowControl.Call or CilFlowControl.ConditionalBranch or CilFlowControl.Break or CilFlowControl.Meta) {
+            while (prevIdx >= 0 && insns[prevIdx].OpCode.Code == CilCode.Nop) {
+                if (HasBranchTargetInRange(insns, prevIdx, prevIdx, -1)) {
                     dispatcherStillReferenced = true;
+                    break;
+                }
+                prevIdx--;
+            }
+            if (!dispatcherStillReferenced) {
+                if (prevIdx < 0) {
+                    dispatcherStillReferenced = true;
+                }
+                else {
+                    var prevFlow = insns[prevIdx].OpCode.FlowControl;
+                    if (prevFlow is CilFlowControl.Next or CilFlowControl.Call or CilFlowControl.ConditionalBranch or CilFlowControl.Break or CilFlowControl.Meta) {
+                        dispatcherStillReferenced = true;
+                    }
                 }
             }
         }

@@ -17,6 +17,9 @@ public static class FunctionService {
                 if (instruction.OpCode.Code != CilCode.Call || !ResolveVirtualMachineEntry(instruction))
                     continue;
 
+                if (i == 0)
+                    continue;
+
                 var constantInstruction = instructions[i - 1];
                 if (constantInstruction.OpCode.Code != CilCode.Ldc_I4)
                     continue;

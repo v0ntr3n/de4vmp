@@ -359,8 +359,12 @@ public sealed class HandlerSemanticClassifier {
             if (codes.Contains(CilCode.Clt)) directOps.Add(SemanticOp.Clt);
             if (codes.Contains(CilCode.Cgt)) directOps.Add(SemanticOp.Cgt);
 
-            if (directOps.Count == 1)
-                return (directOps[0], $"Single semantic CIL op ({directOps[0]}) between structural Pop/Push");
+            if (directOps.Count == 1 && !insns.Any(i => i.IsLdcI4())) {
+                int popCalls = insns.Count(i => i.OpCode.Code is CilCode.Call or CilCode.Callvirt && ReferenceEquals(i.Operand, profile.PopHelper));
+                int expectedPops = directOps[0] == SemanticOp.Neg ? 1 : 2;
+                if (popCalls == expectedPops)
+                    return (directOps[0], $"Single semantic CIL op ({directOps[0]}) between structural Pop/Push");
+            }
         }
 
         // Fail-closed: never guess!

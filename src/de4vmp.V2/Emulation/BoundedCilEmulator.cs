@@ -242,11 +242,19 @@ public sealed class BoundedCilEmulator {
                     var b = Pop(stack); var a = Pop(stack);
                     if (IsI64(a, b)) {
                         long lb = ToI8(b), la = ToI8(a);
-                        stack.Push(lb == 0 ? 0L : (la == long.MinValue && lb == -1 ? long.MinValue : la / lb));
+                        if (lb == 0 || (la == long.MinValue && lb == -1)) {
+                            stopReason = "Division by zero or signed overflow in Div.";
+                            return false;
+                        }
+                        stack.Push(la / lb);
                     }
                     else {
                         int ib = ToI4(b), ia = ToI4(a);
-                        stack.Push(ib == 0 ? 0 : (ia == int.MinValue && ib == -1 ? int.MinValue : ia / ib));
+                        if (ib == 0 || (ia == int.MinValue && ib == -1)) {
+                            stopReason = "Division by zero or signed overflow in Div.";
+                            return false;
+                        }
+                        stack.Push(ia / ib);
                     }
                     ip++; break;
                 }
@@ -254,11 +262,13 @@ public sealed class BoundedCilEmulator {
                     var b = Pop(stack); var a = Pop(stack);
                     if (IsI64(a, b)) {
                         ulong lb = ToU8(b), la = ToU8(a);
-                        stack.Push(lb != 0 ? unchecked((long)(la / lb)) : 0L);
+                        if (lb == 0) { stopReason = "Division by zero in Div_Un."; return false; }
+                        stack.Push(unchecked((long)(la / lb)));
                     }
                     else {
                         uint ib = ToU4(b), ia = ToU4(a);
-                        stack.Push(ib != 0 ? unchecked((int)(ia / ib)) : 0);
+                        if (ib == 0) { stopReason = "Division by zero in Div_Un."; return false; }
+                        stack.Push(unchecked((int)(ia / ib)));
                     }
                     ip++; break;
                 }
@@ -266,11 +276,19 @@ public sealed class BoundedCilEmulator {
                     var b = Pop(stack); var a = Pop(stack);
                     if (IsI64(a, b)) {
                         long lb = ToI8(b), la = ToI8(a);
-                        stack.Push(lb == 0 ? 0L : (la == long.MinValue && lb == -1 ? 0L : la % lb));
+                        if (lb == 0 || (la == long.MinValue && lb == -1)) {
+                            stopReason = "Division by zero or signed overflow in Rem.";
+                            return false;
+                        }
+                        stack.Push(la % lb);
                     }
                     else {
                         int ib = ToI4(b), ia = ToI4(a);
-                        stack.Push(ib == 0 ? 0 : (ia == int.MinValue && ib == -1 ? 0 : ia % ib));
+                        if (ib == 0 || (ia == int.MinValue && ib == -1)) {
+                            stopReason = "Division by zero or signed overflow in Rem.";
+                            return false;
+                        }
+                        stack.Push(ia % ib);
                     }
                     ip++; break;
                 }
@@ -278,11 +296,13 @@ public sealed class BoundedCilEmulator {
                     var b = Pop(stack); var a = Pop(stack);
                     if (IsI64(a, b)) {
                         ulong lb = ToU8(b), la = ToU8(a);
-                        stack.Push(lb != 0 ? unchecked((long)(la % lb)) : 0L);
+                        if (lb == 0) { stopReason = "Division by zero in Rem_Un."; return false; }
+                        stack.Push(unchecked((long)(la % lb)));
                     }
                     else {
                         uint ib = ToU4(b), ia = ToU4(a);
-                        stack.Push(ib != 0 ? unchecked((int)(ia % ib)) : 0);
+                        if (ib == 0) { stopReason = "Division by zero in Rem_Un."; return false; }
+                        stack.Push(unchecked((int)(ia % ib)));
                     }
                     ip++; break;
                 }
@@ -366,15 +386,13 @@ public sealed class BoundedCilEmulator {
                 case CilCode.Brfalse:
                 case CilCode.Brfalse_S: {
                     var v = Pop(stack);
-                    bool isFalse = v is null || (v is int i && i == 0) || (v is bool b && !b) || (v is long l && l == 0);
-                    ip = isFalse ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
+                    ip = IsZeroOrNull(v) ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
                     break;
                 }
                 case CilCode.Brtrue:
                 case CilCode.Brtrue_S: {
                     var v = Pop(stack);
-                    bool isTrue = v is not null && !((v is int i && i == 0) || (v is bool b && !b) || (v is long l && l == 0));
-                    ip = isTrue ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
+                    ip = !IsZeroOrNull(v) ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
                     break;
                 }
                 case CilCode.Beq:
@@ -671,8 +689,25 @@ public sealed class BoundedCilEmulator {
             }
         }
 
-        return true;
+        stopReason = ip < 0
+            ? "Unresolved branch target during bounded emulation."
+            : "Execution fell off the end of method without ret.";
+        return false;
     }
+
+    private static bool IsZeroOrNull(object? v) => v switch {
+        null => true,
+        bool b => !b,
+        int i => i == 0,
+        uint u => u == 0,
+        long l => l == 0,
+        ulong ul => ul == 0,
+        short s => s == 0,
+        ushort us => us == 0,
+        byte by => by == 0,
+        sbyte sb => sb == 0,
+        _ => false
+    };
 
     private static object? Pop(Stack<object?> stack) => stack.Count > 0 ? stack.Pop() : 0;
 
@@ -779,7 +814,7 @@ public sealed class BoundedCilEmulator {
         if (invokeParams.Count != targetParams.Count + 1)
             return false;
         string? declFullName = target.DeclaringType?.FullName;
-        if (invokeParams[0].FullName != declFullName && invokeParams[0].FullName != "System.Object")
+        if (invokeParams[0].FullName != declFullName)
             return false;
         for (int i = 0; i < targetParams.Count; i++) {
             if (invokeParams[i + 1].FullName != targetParams[i].FullName)

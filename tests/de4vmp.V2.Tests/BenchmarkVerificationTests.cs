@@ -60,7 +60,7 @@ public sealed class BenchmarkVerificationTests {
 
             // 6. Write devirtualized PE assembly, run dotnet-ilverify if installed (required in CI), and verify bit-identical execution!
             module.Write(devirtPath);
-            VerifyWithIlVerify(devirtPath);
+            VerifyWithIlVerify(devirtPath, minVerifiedMethods: truth.VirtualizedMethods.Count);
 
             var alc = new CollectibleContext();
             try {
@@ -195,7 +195,7 @@ public sealed class BenchmarkVerificationTests {
         }
     }
 
-    private static void VerifyWithIlVerify(string assemblyPath) {
+    internal static void VerifyWithIlVerify(string assemblyPath, string includePattern = @"SyntheticFixture\.VirtualizedTargets", int minVerifiedMethods = 1) {
         bool required = string.Equals(Environment.GetEnvironmentVariable("DE4VMP_REQUIRE_ILVERIFY"), "1", StringComparison.Ordinal);
         string? ilVerifyPath = FindIlVerifyExecutable();
         if (ilVerifyPath is null) {
@@ -223,15 +223,27 @@ public sealed class BenchmarkVerificationTests {
         psi.ArgumentList.Add("-r");
         psi.ArgumentList.Add(Path.Combine(testBinDir, "*.dll"));
         psi.ArgumentList.Add("-i");
-        psi.ArgumentList.Add(@"SyntheticFixture\.VirtualizedTargets");
+        psi.ArgumentList.Add(includePattern);
+        psi.ArgumentList.Add("--statistics");
 
         using var proc = Process.Start(psi)!;
-        string stdout = proc.StandardOutput.ReadToEnd();
-        string stderr = proc.StandardError.ReadToEnd();
-        proc.WaitForExit(30_000);
+        var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+        var stderrTask = proc.StandardError.ReadToEndAsync();
+        bool exited = proc.WaitForExit(30_000);
+        if (!exited) {
+            try { proc.Kill(entireProcessTree: true); } catch { }
+            Assert.Fail($"dotnet-ilverify timed out after 30s on {assemblyPath}.");
+        }
+
+        string stdout = stdoutTask.GetAwaiter().GetResult();
+        string stderr = stderrTask.GetAwaiter().GetResult();
 
         Assert.True(proc.ExitCode == 0,
             $"dotnet-ilverify failed (exit {proc.ExitCode}) on {assemblyPath}:\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+
+        var match = System.Text.RegularExpressions.Regex.Match(stdout, @"Methods verified:\s*(\d+)");
+        Assert.True(match.Success && int.TryParse(match.Groups[1].Value, out int verifiedCount) && verifiedCount >= minVerifiedMethods,
+            $"dotnet-ilverify verified fewer than {minVerifiedMethods} method(s) (pattern '{includePattern}'):\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}");
     }
 
     private static string? FindIlVerifyExecutable() {

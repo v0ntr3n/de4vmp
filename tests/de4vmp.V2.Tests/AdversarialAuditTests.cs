@@ -90,6 +90,7 @@ public sealed class AdversarialAuditTests {
 
             // Verify 100% differential behavioral equivalence against ReferenceSuite
             reloaded.Write(devirtPath);
+            BenchmarkVerificationTests.VerifyWithIlVerify(devirtPath, minVerifiedMethods: truth.VirtualizedMethods.Count);
             VerifyTier2DifferentialEquivalence(devirtPath);
         }
         finally {
@@ -354,6 +355,7 @@ public sealed class AdversarialAuditTests {
             Assert.Equal(truth.VirtualizedMethods.Count, metrics.MethodsDevirtualized);
 
             reloaded.Write(devirtPath);
+            BenchmarkVerificationTests.VerifyWithIlVerify(devirtPath, minVerifiedMethods: truth.VirtualizedMethods.Count);
             VerifyTier2DifferentialEquivalence(devirtPath);
         }
         finally {
@@ -399,6 +401,7 @@ public sealed class AdversarialAuditTests {
             Assert.Equal(truth.VirtualizedMethods.Count, metrics.MethodsDevirtualized);
 
             reloaded.Write(devirtPath);
+            BenchmarkVerificationTests.VerifyWithIlVerify(devirtPath, minVerifiedMethods: truth.VirtualizedMethods.Count);
             VerifyTier2DifferentialEquivalence(devirtPath);
         }
         finally {

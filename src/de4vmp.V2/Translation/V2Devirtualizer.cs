@@ -391,6 +391,22 @@ public sealed class V2Devirtualizer {
         if (startIdx < 0)
             return false;
 
+        // Guard against control-flow merges: reject if any branch targets an interior instruction or callIndex itself.
+        for (int i = 0; i < insns.Count; i++) {
+            if (insns[i].Operand is ICilLabel lbl) {
+                int target = ResolveLabelIndex(insns, lbl);
+                if (target > startIdx && target <= callIndex)
+                    return false;
+            }
+            else if (insns[i].Operand is IList<ICilLabel> targets) {
+                foreach (var t in targets) {
+                    int target = ResolveLabelIndex(insns, t);
+                    if (target > startIdx && target <= callIndex)
+                        return false;
+                }
+            }
+        }
+
         var eval = new Stack<int>();
         for (int k = startIdx; k < callIndex; k++) {
             var ins = insns[k];
@@ -431,16 +447,16 @@ public sealed class V2Devirtualizer {
                 case CilCode.Sub: eval.Push(unchecked(lhs - b)); break;
                 case CilCode.Mul: eval.Push(unchecked(lhs * b)); break;
                 case CilCode.Div:
-                    if (b == 0) return false;
-                    eval.Push(lhs == int.MinValue && b == -1 ? int.MinValue : lhs / b);
+                    if (b == 0 || (lhs == int.MinValue && b == -1)) return false;
+                    eval.Push(lhs / b);
                     break;
                 case CilCode.Div_Un:
                     if (b == 0) return false;
                     eval.Push(unchecked((int)((uint)lhs / (uint)b)));
                     break;
                 case CilCode.Rem:
-                    if (b == 0) return false;
-                    eval.Push(lhs == int.MinValue && b == -1 ? 0 : lhs % b);
+                    if (b == 0 || (lhs == int.MinValue && b == -1)) return false;
+                    eval.Push(lhs % b);
                     break;
                 case CilCode.Rem_Un:
                     if (b == 0) return false;
@@ -743,6 +759,17 @@ public sealed class V2Devirtualizer {
         site.Caller.CilMethodBody = newBody;
         newBody.ComputeMaxStack();
         return true;
+    }
+
+    private static int ResolveLabelIndex(CilInstructionCollection insns, ICilLabel label) {
+        if (label is CilInstructionLabel il && il.Instruction is not null)
+            return insns.IndexOf(il.Instruction);
+        int offset = label.Offset;
+        for (int i = 0; i < insns.Count; i++) {
+            if (insns[i].Offset == offset)
+                return i;
+        }
+        return -1;
     }
 
     private static IMetadataMember? TryLookupMember(ModuleDefinition module, int token) =>
