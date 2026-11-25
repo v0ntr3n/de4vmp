@@ -61,7 +61,7 @@ public class HandlerResolver {
     }
 
     private void ResolveInvalidHandlers(IDictionary<byte, HandlerBase> handlers, int count) {
-        foreach (var handler in _handlers.Where(handler => handlers.Values.Contains(handler)))
+        foreach (var handler in _handlers.Where(handler => !handlers.Values.Contains(handler)))
             _logger.Warning(this, $"Handler: {handler.Translates} could not be resolved!");
 
         _logger.Debug(this, $"Resolved {handlers.Count} out of {count} embedded handlers");

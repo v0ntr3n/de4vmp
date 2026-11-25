@@ -2,7 +2,7 @@
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Builder;
 using AsmResolver.DotNet.Code.Cil;
-using AsmResolver.PE.DotNet.Builder;
+using AsmResolver.PE.Builder;
 using de4vmp.Core.Pipeline;
 using de4vmp.Core.Pipeline.Phases;
 

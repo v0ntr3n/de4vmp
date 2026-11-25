@@ -1,5 +1,6 @@
-﻿using AsmResolver.DotNet.Code.Cil;
-using AsmResolver.DotNet.Signatures.Types;
+﻿using AsmResolver.DotNet;
+using AsmResolver.DotNet.Code.Cil;
+using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using de4vmp.Core.Architecture;
 using de4vmp.Core.Architecture.ExceptionHandlers;
@@ -36,6 +37,8 @@ public class VmpRecompiler {
 
     public CorLibTypeFactory TypeFactory => _context.Module.CorLibTypeFactory;
 
+    public RuntimeContext? RuntimeContext => _context.Module.RuntimeContext;
+
     public TypeSignature ReturnType { get; private set; }
 
     private static IEnumerable<ITransform> CollectTransforms(Type type) {
@@ -66,7 +69,7 @@ public class VmpRecompiler {
         if (methodDefinition.Signature is not null)
             ReturnType = methodDefinition.Signature.ReturnType;
 
-        var cilMethodBody = new CilMethodBody(methodDefinition);
+        var cilMethodBody = new CilMethodBody();
 
         _variables = new List<CilLocalVariable>();
         foreach (var variable in function.Variables) 
@@ -95,6 +98,7 @@ public class VmpRecompiler {
 
         cilMethodBody.Instructions.CalculateOffsets();
         cilMethodBody.Instructions.OptimizeMacros();
+        methodDefinition.CilMethodBody = cilMethodBody;
 
         try {
             cilMethodBody.VerifyLabels();

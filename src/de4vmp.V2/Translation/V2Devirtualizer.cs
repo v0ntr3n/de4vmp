@@ -110,10 +110,9 @@ public sealed class V2Devirtualizer {
                 continue;
             }
 
-            // Extract embedded bytecode blob and optional rolling-key parameters from static fields / FieldRva
-            byte[] blob = ExtractBytecodeBlob(type);
-            uint keySeed = ExtractStaticUIntField(type, "KeySeed", staticFields);
-            uint keyStep = ExtractStaticUIntField(type, "KeyStep", staticFields);
+            // Structurally discover bytecode blob and optional rolling-key parameters without relying on hardcoded names
+            var candidateOffsets = CollectCandidateCallSiteOffsets(module, type, entryMethods);
+            var (blob, keySeed, keyStep) = ExtractBytecodeAndKeys(type, staticFields, handlers, hasUIntDict, candidateOffsets);
 
             return new VmDiscoveryResult(
                 type,
@@ -139,45 +138,180 @@ public sealed class V2Devirtualizer {
         return (p0 == "System.Object[]" || p0 == "System.Object") && p1 == "System.Int32";
     }
 
-    private static byte[] ExtractBytecodeBlob(TypeDefinition vmType) {
-        // 1. Check embedded ManifestResource ("VmBytecode")
-        if (vmType.DeclaringModule is { } mod) {
-            var res = mod.Resources.FirstOrDefault(r => r.Name == "VmBytecode");
-            if (res?.GetData() is { Length: > 0 } resData)
-                return resData;
+    private static (byte[] Blob, uint KeySeed, uint KeyStep) ExtractBytecodeAndKeys(
+        TypeDefinition vmType,
+        Dictionary<string, object?> staticFields,
+        IReadOnlyDictionary<uint, MethodDefinition> handlers,
+        bool is32BitKeyed,
+        IReadOnlyList<int> candidateOffsets) {
+        var candidateBlobs = CollectCandidateBlobs(vmType);
+        if (candidateBlobs.Count == 0)
+            return (Array.Empty<byte>(), 0u, 0u);
+
+        var candidateKeyPairs = CollectCandidateKeyPairs(vmType, staticFields);
+        var offsetsToProbe = candidateOffsets.Count > 0 ? candidateOffsets : [0];
+        int keySize = is32BitKeyed ? 4 : 1;
+
+        byte[]? bestBlob = null;
+        uint bestSeed = 0u;
+        uint bestStep = 0u;
+        int bestScore = 0;
+
+        foreach (var blob in candidateBlobs) {
+            foreach (var (seed, step) in candidateKeyPairs) {
+                byte[] decoded = DecryptBytecode(blob, seed, step);
+                int score = ScoreDecodedBlob(decoded, offsetsToProbe, handlers, is32BitKeyed, keySize);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestBlob = blob;
+                    bestSeed = seed;
+                    bestStep = step;
+                }
+            }
         }
-        // 2. Check FieldRva-backed static field
+
+        if (bestBlob is not null)
+            return (bestBlob, bestSeed, bestStep);
+
+        // Fallback when no candidate fully validates (e.g. truncated bytecode): return first structural blob candidate
+        return (candidateBlobs[0], 0u, 0u);
+    }
+
+    private static List<byte[]> CollectCandidateBlobs(TypeDefinition vmType) {
+        var nonStandardResources = new List<byte[]>();
+        var standardResources = new List<byte[]>();
+        var rvaBlobs = new List<byte[]>();
+
+        if (vmType.DeclaringModule is { } mod) {
+            foreach (var res in mod.Resources) {
+                if (res.GetData() is not { Length: > 0 } data)
+                    continue;
+                string name = res.Name ?? string.Empty;
+                if (name.EndsWith(".g.resources", StringComparison.OrdinalIgnoreCase) ||
+                    name.EndsWith(".resources", StringComparison.OrdinalIgnoreCase)) {
+                    standardResources.Add(data);
+                }
+                else {
+                    nonStandardResources.Add(data);
+                }
+            }
+        }
+
         foreach (var field in vmType.Fields) {
             if (field.FieldRva is { } seg) {
                 byte[] bytes = seg.WriteIntoArray();
-                if (bytes.Length > 0) return bytes;
+                if (bytes.Length > 0)
+                    rvaBlobs.Add(bytes);
             }
         }
-        // 3. Check .cctor for ldtoken <rvaField> + RuntimeHelpers.InitializeArray
+
         var cctor = vmType.GetStaticConstructor();
         if (cctor?.CilMethodBody is { } body) {
             foreach (var ins in body.Instructions) {
                 if (ins.OpCode.Code == CilCode.Ldtoken && ins.Operand is FieldDefinition { FieldRva: { } seg }) {
                     byte[] bytes = seg.WriteIntoArray();
-                    if (bytes.Length > 0) return bytes;
+                    if (bytes.Length > 0)
+                        rvaBlobs.Add(bytes);
                 }
             }
         }
-        return Array.Empty<byte>();
+
+        var result = new List<byte[]>(nonStandardResources.Count + rvaBlobs.Count + standardResources.Count);
+        result.AddRange(nonStandardResources);
+        result.AddRange(rvaBlobs);
+        result.AddRange(standardResources);
+        return result;
     }
 
-    private static uint ExtractStaticUIntField(TypeDefinition vmType, string name, Dictionary<string, object?> staticFields) {
-        if (staticFields.TryGetValue(name, out var v)) {
-            return v switch {
-                int i => unchecked((uint)i),
-                uint u => u,
-                _ => 0u
-            };
+    private static List<(uint Seed, uint Step)> CollectCandidateKeyPairs(
+        TypeDefinition vmType,
+        Dictionary<string, object?> staticFields) {
+        var values = new List<uint>();
+        var seen = new HashSet<uint>();
+
+        static void AddCandidate(uint v, List<uint> list, HashSet<uint> seenSet) {
+            if (v != 0 && seenSet.Add(v))
+                list.Add(v);
         }
-        var f = vmType.Fields.FirstOrDefault(x => x.Name == name);
-        if (f?.Constant?.Value?.Data is { Length: >= 4 } bytes)
-            return BitConverter.ToUInt32(bytes, 0);
-        return 0u;
+
+        foreach (var (_, v) in staticFields) {
+            if (v is int i) AddCandidate(unchecked((uint)i), values, seen);
+            else if (v is uint u) AddCandidate(u, values, seen);
+        }
+
+        foreach (var field in vmType.Fields) {
+            if (!field.IsStatic)
+                continue;
+            string? fType = field.Signature?.FieldType.FullName;
+            if (fType is not ("System.UInt32" or "System.Int32"))
+                continue;
+            if (field.Constant?.Value?.Data is { Length: >= 4 } bytes)
+                AddCandidate(BitConverter.ToUInt32(bytes, 0), values, seen);
+        }
+
+        var pairs = new List<(uint Seed, uint Step)> { (0u, 0u) };
+        for (int i = 0; i < values.Count; i++) {
+            pairs.Add((values[i], 0u));
+            for (int j = 0; j < values.Count; j++) {
+                if (i != j)
+                    pairs.Add((values[i], values[j]));
+            }
+        }
+        return pairs;
+    }
+
+    private static int ScoreDecodedBlob(
+        byte[] decoded,
+        IReadOnlyList<int> offsets,
+        IReadOnlyDictionary<uint, MethodDefinition> handlers,
+        bool is32BitKeyed,
+        int keySize) {
+        int score = 0;
+        foreach (int offset in offsets) {
+            if (offset < 0 || offset + 12 + keySize > decoded.Length)
+                continue;
+
+            int localCount = BitConverter.ToInt32(decoded, offset);
+            int insnCount = BitConverter.ToInt32(decoded, offset + 4);
+            int ehCount = BitConverter.ToInt32(decoded, offset + 8);
+            if (localCount < 0 || localCount > 256 || insnCount <= 0 || insnCount > 10_000 || ehCount < 0 || ehCount > 64)
+                continue;
+
+            uint firstKey = is32BitKeyed
+                ? BitConverter.ToUInt32(decoded, offset + 12)
+                : decoded[offset + 12];
+            if (handlers.ContainsKey(firstKey))
+                score++;
+        }
+        return score;
+    }
+
+    private static List<int> CollectCandidateCallSiteOffsets(
+        ModuleDefinition module,
+        TypeDefinition vmType,
+        IReadOnlyList<MethodDefinition> entryMethods) {
+        var entrySet = new HashSet<MethodDefinition>(entryMethods);
+        var offsets = new List<int>();
+        foreach (var type in module.GetAllTypes()) {
+            if (type == vmType)
+                continue;
+            foreach (var method in type.Methods) {
+                if (method.CilMethodBody is not { } body)
+                    continue;
+                var insns = body.Instructions;
+                for (int i = 1; i < insns.Count; i++) {
+                    if (insns[i].OpCode.Code is not (CilCode.Call or CilCode.Callvirt))
+                        continue;
+                    if (insns[i].Operand is not MethodDefinition callee || !entrySet.Contains(callee))
+                        continue;
+                    if (TryEvaluatePrecedingConstantInt32(insns, i, out int offset) && offset >= 0) {
+                        offsets.Add(offset);
+                        break;
+                    }
+                }
+            }
+        }
+        return offsets;
     }
 
     private static List<VerifiedCallSite> FindVerifiedCallSites(ModuleDefinition module, VmDiscoveryResult vm) {
@@ -196,10 +330,9 @@ public sealed class V2Devirtualizer {
                         continue;
                     if (insns[i].Operand is not MethodDefinition callee || !entrySet.Contains(callee))
                         continue;
-                    if (!insns[i - 1].IsLdcI4())
+                    if (!TryEvaluatePrecedingConstantInt32(insns, i, out int offset))
                         continue;
 
-                    int offset = insns[i - 1].GetLdcI4Constant();
                     // Verify offset actually points within the discovered bytecode blob
                     if (vm.BytecodeBlob.Length > 0 && (offset < 0 || offset >= vm.BytecodeBlob.Length))
                         continue;
@@ -213,6 +346,128 @@ public sealed class V2Devirtualizer {
         return sites;
     }
 
+    /// <summary>
+    /// Evaluates a pure-constant integer expression immediately preceding <paramref name="callIndex"/>
+    /// (e.g. `ldc.i4 X`, `ldc.i4 A; ldc.i4 B; xor`, or arbitrary nested pure arithmetic/bitwise expressions).
+    /// </summary>
+    private static bool TryEvaluatePrecedingConstantInt32(CilInstructionCollection insns, int callIndex, out int value) {
+        value = 0;
+        int needed = 1;
+        int startIdx = -1;
+        int minIdx = Math.Max(0, callIndex - 64);
+
+        for (int k = callIndex - 1; k >= minIdx; k--) {
+            var ins = insns[k];
+            var code = ins.OpCode.Code;
+            if (code == CilCode.Nop) {
+                continue;
+            }
+            if (ins.IsLdcI4()) {
+                needed -= 1;
+            }
+            else if (code is CilCode.Neg or CilCode.Not or CilCode.Conv_I1 or CilCode.Conv_U1
+                or CilCode.Conv_I2 or CilCode.Conv_U2 or CilCode.Conv_I4 or CilCode.Conv_U4) {
+                // Unary: consumes 1, produces 1 -> needed unchanged
+            }
+            else if (code is CilCode.Add or CilCode.Sub or CilCode.Mul or CilCode.Div or CilCode.Div_Un
+                or CilCode.Rem or CilCode.Rem_Un or CilCode.Xor or CilCode.And or CilCode.Or
+                or CilCode.Shl or CilCode.Shr or CilCode.Shr_Un
+                or CilCode.Ceq or CilCode.Clt or CilCode.Clt_Un or CilCode.Cgt or CilCode.Cgt_Un) {
+                needed += 1;
+            }
+            else if (code == CilCode.Dup && needed >= 2) {
+                needed -= 1;
+            }
+            else {
+                return false;
+            }
+
+            if (needed == 0) {
+                startIdx = k;
+                break;
+            }
+        }
+
+        if (startIdx < 0)
+            return false;
+
+        var eval = new Stack<int>();
+        for (int k = startIdx; k < callIndex; k++) {
+            var ins = insns[k];
+            var code = ins.OpCode.Code;
+            if (code == CilCode.Nop)
+                continue;
+            if (ins.IsLdcI4()) {
+                eval.Push(ins.GetLdcI4Constant());
+                continue;
+            }
+            if (code == CilCode.Dup) {
+                if (eval.Count < 1) return false;
+                eval.Push(eval.Peek());
+                continue;
+            }
+            if (code is CilCode.Neg or CilCode.Not or CilCode.Conv_I1 or CilCode.Conv_U1
+                or CilCode.Conv_I2 or CilCode.Conv_U2 or CilCode.Conv_I4 or CilCode.Conv_U4) {
+                if (eval.Count < 1) return false;
+                int a = eval.Pop();
+                eval.Push(code switch {
+                    CilCode.Neg => unchecked(-a),
+                    CilCode.Not => ~a,
+                    CilCode.Conv_I1 => (sbyte)a,
+                    CilCode.Conv_U1 => (byte)a,
+                    CilCode.Conv_I2 => (short)a,
+                    CilCode.Conv_U2 => (ushort)a,
+                    _ => a
+                });
+                continue;
+            }
+
+            if (eval.Count < 2)
+                return false;
+            int b = eval.Pop();
+            int lhs = eval.Pop();
+            switch (code) {
+                case CilCode.Add: eval.Push(unchecked(lhs + b)); break;
+                case CilCode.Sub: eval.Push(unchecked(lhs - b)); break;
+                case CilCode.Mul: eval.Push(unchecked(lhs * b)); break;
+                case CilCode.Div:
+                    if (b == 0) return false;
+                    eval.Push(lhs == int.MinValue && b == -1 ? int.MinValue : lhs / b);
+                    break;
+                case CilCode.Div_Un:
+                    if (b == 0) return false;
+                    eval.Push(unchecked((int)((uint)lhs / (uint)b)));
+                    break;
+                case CilCode.Rem:
+                    if (b == 0) return false;
+                    eval.Push(lhs == int.MinValue && b == -1 ? 0 : lhs % b);
+                    break;
+                case CilCode.Rem_Un:
+                    if (b == 0) return false;
+                    eval.Push(unchecked((int)((uint)lhs % (uint)b)));
+                    break;
+                case CilCode.Xor: eval.Push(lhs ^ b); break;
+                case CilCode.And: eval.Push(lhs & b); break;
+                case CilCode.Or:  eval.Push(lhs | b); break;
+                case CilCode.Shl: eval.Push(lhs << (b & 31)); break;
+                case CilCode.Shr: eval.Push(lhs >> (b & 31)); break;
+                case CilCode.Shr_Un: eval.Push(unchecked((int)((uint)lhs >> (b & 31)))); break;
+                case CilCode.Ceq: eval.Push(lhs == b ? 1 : 0); break;
+                case CilCode.Clt: eval.Push(lhs < b ? 1 : 0); break;
+                case CilCode.Clt_Un: eval.Push((uint)lhs < (uint)b ? 1 : 0); break;
+                case CilCode.Cgt: eval.Push(lhs > b ? 1 : 0); break;
+                case CilCode.Cgt_Un: eval.Push((uint)lhs > (uint)b ? 1 : 0); break;
+                default: return false;
+            }
+        }
+
+        if (eval.Count != 1)
+            return false;
+
+        value = eval.Pop();
+        return true;
+    }
+
     private static bool TryRecompileMethod(
         ModuleDefinition module,
         VmDiscoveryResult vm,
@@ -220,7 +475,7 @@ public sealed class V2Devirtualizer {
         VerifiedCallSite site,
         List<string> diagnostics) {
         byte[] decoded = DecryptBytecode(vm.BytecodeBlob, vm.RollingKeySeed, vm.RollingKeyStep);
-        if (site.BytecodeOffset < 0 || site.BytecodeOffset + 8 > decoded.Length) {
+        if (site.BytecodeOffset < 0 || site.BytecodeOffset + 12 > decoded.Length) {
             diagnostics.Add($"Method {site.Caller.FullName}: invalid bytecode offset {site.BytecodeOffset}.");
             return false;
         }
@@ -238,8 +493,13 @@ public sealed class V2Devirtualizer {
             return false;
         }
 
+        int keySize = vm.Is32BitKeyed ? 4 : 1;
         var vOps = new List<(SemanticOp Op, int Operand)>(insnCount);
         for (int i = 0; i < insnCount; i++) {
+            if (ms.Length - ms.Position < keySize) {
+                diagnostics.Add($"Method {site.Caller.FullName}: truncated bytecode stream reading opcode at vIP {i}.");
+                return false;
+            }
             uint key = vm.Is32BitKeyed ? br.ReadUInt32() : br.ReadByte();
             if (!handlers.TryGetValue(key, out var handler) || handler.SemanticOp == SemanticOp.Unknown) {
                 // Fail-closed: never emit partial/guessed IL when a handler is Unknown!
@@ -247,12 +507,23 @@ public sealed class V2Devirtualizer {
                 return false;
             }
 
-            int operand = HasInt32Operand(handler.SemanticOp) ? br.ReadInt32() : 0;
+            int operand = 0;
+            if (HasInt32Operand(handler.SemanticOp)) {
+                if (ms.Length - ms.Position < 4) {
+                    diagnostics.Add($"Method {site.Caller.FullName}: truncated bytecode stream reading operand for {handler.SemanticOp} at vIP {i}.");
+                    return false;
+                }
+                operand = br.ReadInt32();
+            }
             vOps.Add((handler.SemanticOp, operand));
         }
 
         var ehSpecs = new List<(int Kind, int TryStart, int TryEnd, int HandlerStart, int HandlerEnd, int CatchTypeToken)>(ehCount);
         for (int i = 0; i < ehCount; i++) {
+            if (ms.Length - ms.Position < 24) {
+                diagnostics.Add($"Method {site.Caller.FullName}: truncated bytecode stream reading EH entry {i}.");
+                return false;
+            }
             ehSpecs.Add((br.ReadInt32(), br.ReadInt32(), br.ReadInt32(), br.ReadInt32(), br.ReadInt32(), br.ReadInt32()));
         }
 
@@ -268,8 +539,15 @@ public sealed class V2Devirtualizer {
                 if (prev.Op == SemanticOp.NewObj && TryLookupMember(module, prev.Operand) is IMethodDescriptor ctor && ctor.DeclaringType is not null) {
                     localTypes[vOps[i].Operand] = new TypeDefOrRefSignature(ctor.DeclaringType.ToTypeDefOrRef(), isValueType: false);
                 }
-                else if (prev.Op == SemanticOp.LdArg && prev.Operand >= 0 && prev.Operand < site.Caller.Parameters.Count) {
-                    localTypes[vOps[i].Operand] = site.Caller.Parameters[prev.Operand].ParameterType;
+                else if (prev.Op == SemanticOp.LdArg) {
+                    if (!site.Caller.IsStatic && prev.Operand == 0 && site.Caller.DeclaringType is not null) {
+                        localTypes[vOps[i].Operand] = site.Caller.DeclaringType.ToTypeSignature();
+                    }
+                    else {
+                        int paramIdx = site.Caller.IsStatic ? prev.Operand : prev.Operand - 1;
+                        if (paramIdx >= 0 && paramIdx < site.Caller.Parameters.Count)
+                            localTypes[vOps[i].Operand] = site.Caller.Parameters[paramIdx].ParameterType;
+                    }
                 }
             }
         }
@@ -297,12 +575,38 @@ public sealed class V2Devirtualizer {
                 case SemanticOp.Nop: newBody.Instructions.Add(CilOpCodes.Nop); break;
                 case SemanticOp.LdcI4: newBody.Instructions.Add(CilOpCodes.Ldc_I4, operand); break;
                 case SemanticOp.LdArg:
-                    newBody.Instructions.Add(CilOpCodes.Ldarg, site.Caller.Parameters[operand]);
+                    if (!site.Caller.IsStatic) {
+                        if (operand == 0) {
+                            newBody.Instructions.Add(CilOpCodes.Ldarg_0);
+                        }
+                        else if (operand > 0 && operand - 1 < site.Caller.Parameters.Count) {
+                            newBody.Instructions.Add(CilOpCodes.Ldarg, site.Caller.Parameters[operand - 1]);
+                        }
+                        else {
+                            diagnostics.Add($"Method {site.Caller.FullName}: instance LdArg index {operand} out of range at vIP {i}.");
+                            return false;
+                        }
+                    }
+                    else {
+                        if (operand < 0 || operand >= site.Caller.Parameters.Count) {
+                            diagnostics.Add($"Method {site.Caller.FullName}: static LdArg index {operand} out of range at vIP {i}.");
+                            return false;
+                        }
+                        newBody.Instructions.Add(CilOpCodes.Ldarg, site.Caller.Parameters[operand]);
+                    }
                     break;
                 case SemanticOp.LdLoc:
+                    if (operand < 0 || operand >= newBody.LocalVariables.Count) {
+                        diagnostics.Add($"Method {site.Caller.FullName}: LdLoc index {operand} out of range at vIP {i}.");
+                        return false;
+                    }
                     newBody.Instructions.Add(CilOpCodes.Ldloc, newBody.LocalVariables[operand]);
                     break;
                 case SemanticOp.StLoc:
+                    if (operand < 0 || operand >= newBody.LocalVariables.Count) {
+                        diagnostics.Add($"Method {site.Caller.FullName}: StLoc index {operand} out of range at vIP {i}.");
+                        return false;
+                    }
                     newBody.Instructions.Add(CilOpCodes.Stloc, newBody.LocalVariables[operand]);
                     break;
                 case SemanticOp.Add: newBody.Instructions.Add(CilOpCodes.Add); break;
@@ -339,19 +643,39 @@ public sealed class V2Devirtualizer {
                 }
                 case SemanticOp.Ret: newBody.Instructions.Add(CilOpCodes.Ret); break;
                 case SemanticOp.NewObj:
-                    newBody.Instructions.Add(CilOpCodes.Newobj, (IMethodDescriptor)TryLookupMember(module, operand)!);
+                    if (TryLookupMember(module, operand) is not IMethodDescriptor newObjCtor) {
+                        diagnostics.Add($"Method {site.Caller.FullName}: invalid NewObj token 0x{operand:X8} at vIP {i}.");
+                        return false;
+                    }
+                    newBody.Instructions.Add(CilOpCodes.Newobj, newObjCtor);
                     break;
                 case SemanticOp.LdFld:
-                    newBody.Instructions.Add(CilOpCodes.Ldfld, (IFieldDescriptor)TryLookupMember(module, operand)!);
+                    if (TryLookupMember(module, operand) is not IFieldDescriptor ldFld) {
+                        diagnostics.Add($"Method {site.Caller.FullName}: invalid LdFld token 0x{operand:X8} at vIP {i}.");
+                        return false;
+                    }
+                    newBody.Instructions.Add(CilOpCodes.Ldfld, ldFld);
                     break;
                 case SemanticOp.StFld:
-                    newBody.Instructions.Add(CilOpCodes.Stfld, (IFieldDescriptor)TryLookupMember(module, operand)!);
+                    if (TryLookupMember(module, operand) is not IFieldDescriptor stFld) {
+                        diagnostics.Add($"Method {site.Caller.FullName}: invalid StFld token 0x{operand:X8} at vIP {i}.");
+                        return false;
+                    }
+                    newBody.Instructions.Add(CilOpCodes.Stfld, stFld);
                     break;
                 case SemanticOp.Call:
-                    newBody.Instructions.Add(CilOpCodes.Call, (IMethodDescriptor)TryLookupMember(module, operand)!);
+                    if (TryLookupMember(module, operand) is not IMethodDescriptor callTarget) {
+                        diagnostics.Add($"Method {site.Caller.FullName}: invalid Call token 0x{operand:X8} at vIP {i}.");
+                        return false;
+                    }
+                    newBody.Instructions.Add(CilOpCodes.Call, callTarget);
                     break;
                 case SemanticOp.CallVirt:
-                    newBody.Instructions.Add(CilOpCodes.Callvirt, (IMethodDescriptor)TryLookupMember(module, operand)!);
+                    if (TryLookupMember(module, operand) is not IMethodDescriptor callVirtTarget) {
+                        diagnostics.Add($"Method {site.Caller.FullName}: invalid CallVirt token 0x{operand:X8} at vIP {i}.");
+                        return false;
+                    }
+                    newBody.Instructions.Add(CilOpCodes.Callvirt, callVirtTarget);
                     break;
                 case SemanticOp.LdElemI4: newBody.Instructions.Add(CilOpCodes.Ldelem_I4); break;
                 case SemanticOp.StElemI4: newBody.Instructions.Add(CilOpCodes.Stelem_I4); break;
@@ -385,17 +709,31 @@ public sealed class V2Devirtualizer {
 
         // Wire ECMA-335 Exception Handlers
         foreach (var eh in ehSpecs) {
+            if (eh.TryStart < 0 || eh.TryStart >= vOps.Count ||
+                eh.TryEnd <= eh.TryStart || eh.TryEnd > vOps.Count ||
+                eh.HandlerStart < 0 || eh.HandlerStart >= vOps.Count ||
+                eh.HandlerEnd <= eh.HandlerStart || eh.HandlerEnd > vOps.Count) {
+                diagnostics.Add($"Method {site.Caller.FullName}: EH region out of range (try [{eh.TryStart}..{eh.TryEnd}), handler [{eh.HandlerStart}..{eh.HandlerEnd})).");
+                return false;
+            }
+
             var cilEh = new CilExceptionHandler {
                 HandlerType = eh.Kind == 0 ? CilExceptionHandlerType.Exception : CilExceptionHandlerType.Finally,
                 TryStart = vIndexToCil[eh.TryStart].CreateLabel(),
-                TryEnd = vIndexToCil[eh.TryEnd].CreateLabel(),
+                TryEnd = eh.TryEnd < vOps.Count
+                    ? vIndexToCil[eh.TryEnd].CreateLabel()
+                    : newBody.Instructions.EndLabel,
                 HandlerStart = vIndexToCil[eh.HandlerStart].CreateLabel(),
                 HandlerEnd = eh.HandlerEnd < vOps.Count
                     ? vIndexToCil[eh.HandlerEnd].CreateLabel()
                     : newBody.Instructions.EndLabel
             };
             if (eh.Kind == 0 && eh.CatchTypeToken != 0) {
-                cilEh.ExceptionType = (ITypeDefOrRef)TryLookupMember(module, eh.CatchTypeToken)!;
+                if (TryLookupMember(module, eh.CatchTypeToken) is not ITypeDefOrRef catchType) {
+                    diagnostics.Add($"Method {site.Caller.FullName}: invalid EH catch type token 0x{eh.CatchTypeToken:X8}.");
+                    return false;
+                }
+                cilEh.ExceptionType = catchType;
             }
             newBody.ExceptionHandlers.Add(cilEh);
         }
@@ -408,7 +746,7 @@ public sealed class V2Devirtualizer {
     }
 
     private static IMetadataMember? TryLookupMember(ModuleDefinition module, int token) =>
-        module.LookupMember(new MetadataToken((uint)token));
+        module.TryLookupMember(new MetadataToken((uint)token), out var member) ? member : null;
 
     private static bool HasInt32Operand(SemanticOp op) => op is
         SemanticOp.LdcI4 or SemanticOp.LdArg or SemanticOp.LdLoc or SemanticOp.StLoc or

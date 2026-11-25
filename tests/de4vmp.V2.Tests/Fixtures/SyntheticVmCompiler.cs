@@ -107,7 +107,41 @@ public sealed class SyntheticVmCompiler {
             opToKey[BaseOps[i]] = key;
         }
 
-        // VM helper stub methods (so handlers reference realistic semantic helper names)
+        // VM runtime state fields (used by helpers with real, name-invariant CIL semantics)
+        var boolType = corlib.Boolean;
+        var stackOpen = importer.ImportType(typeof(Stack<>));
+        var intStackSig = new GenericInstanceTypeSignature(stackOpen, isValueType: false, [int32Type]);
+        var intStackTypeSpec = new TypeSpecification(intStackSig);
+        var intStackPop = new MemberReference(intStackTypeSpec, "Pop",
+            MethodSignature.CreateInstance(new GenericParameterSignature(GenericParameterType.Type, 0)));
+
+        var codeField = new FieldDefinition("_code", FieldAttributes.Private, new FieldSignature(byteArrayType));
+        var ipField = new FieldDefinition("_ip", FieldAttributes.Private, new FieldSignature(int32Type));
+        var spField = new FieldDefinition("_sp", FieldAttributes.Private, new FieldSignature(int32Type));
+        var stackField = new FieldDefinition("_stack", FieldAttributes.Private, new FieldSignature(intArrayType));
+        var argsField = new FieldDefinition("_args", FieldAttributes.Private, new FieldSignature(objArrayType));
+        var localsField = new FieldDefinition("_locals", FieldAttributes.Private, new FieldSignature(intArrayType));
+        var haltedField = new FieldDefinition("_halted", FieldAttributes.Private, new FieldSignature(boolType));
+        var ehStackField = new FieldDefinition("_ehStack", FieldAttributes.Private, new FieldSignature(intStackSig));
+
+        vmType.Fields.Add(codeField);
+        vmType.Fields.Add(ipField);
+        vmType.Fields.Add(spField);
+        vmType.Fields.Add(stackField);
+        vmType.Fields.Add(argsField);
+        vmType.Fields.Add(localsField);
+        vmType.Fields.Add(haltedField);
+        vmType.Fields.Add(ehStackField);
+
+        var bitConvToInt32 = importer.ImportMethod(typeof(BitConverter).GetMethod(nameof(BitConverter.ToInt32), [typeof(byte[]), typeof(int)])!);
+        var activatorCreate = importer.ImportMethod(typeof(Activator).GetMethod(nameof(Activator.CreateInstance), [typeof(Type)])!);
+        var fieldInfoGetValue = importer.ImportMethod(typeof(System.Reflection.FieldInfo).GetMethod(nameof(System.Reflection.FieldInfo.GetValue), [typeof(object)])!);
+        var fieldInfoSetValue = importer.ImportMethod(typeof(System.Reflection.FieldInfo).GetMethod(nameof(System.Reflection.FieldInfo.SetValue), [typeof(object), typeof(object)])!);
+        var methodBaseInvoke = importer.ImportMethod(typeof(System.Reflection.MethodBase).GetMethod(nameof(System.Reflection.MethodBase.Invoke), [typeof(object), typeof(object[])])!);
+        var methodBaseGetIsVirtual = importer.ImportMethod(typeof(System.Reflection.MethodBase).GetProperty(nameof(System.Reflection.MethodBase.IsVirtual))!.GetMethod!);
+        var methodBaseTypeSig = importer.ImportTypeSignature(typeof(System.Reflection.MethodBase));
+
+        // VM helper methods with real, distinguishable minimal CIL semantics (completely invariant to renaming)
         var helperNames = new[] {
             "ReadI4", "Push", "Pop", "GetArg", "GetLoc", "SetLoc",
             "Jump", "JumpIfTrue", "JumpIfFalse", "Halt",
@@ -122,12 +156,295 @@ public sealed class SyntheticVmCompiler {
                 _ => MethodSignature.CreateInstance(voidType)
             };
             var hm = new MethodDefinition(hName, MethodAttributes.Private, sig);
-            var hb = new CilMethodBody();
-            if (sig.ReturnsValue) hb.Instructions.Add(CilOpCodes.Ldc_I4_0);
-            hb.Instructions.Add(CilOpCodes.Ret);
-            hm.CilMethodBody = hb;
             vmType.Methods.Add(hm);
             helpers[hName] = hm;
+        }
+
+        // Populate each helper's real CIL body
+        {
+            // Op_Nop: empty no-op
+            var b = new CilMethodBody();
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["Op_Nop"].CilMethodBody = b;
+        }
+        {
+            // ReadI4: int val = BitConverter.ToInt32(_code, _ip); _ip += 4; return val;
+            var b = new CilMethodBody { InitializeLocals = true };
+            var valLoc = new CilLocalVariable(int32Type);
+            b.LocalVariables.Add(valLoc);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldfld, codeField);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldfld, ipField);
+            b.Instructions.Add(CilOpCodes.Call, bitConvToInt32);
+            b.Instructions.Add(CilOpCodes.Stloc, valLoc);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldfld, ipField);
+            b.Instructions.Add(CilOpCodes.Ldc_I4_4);
+            b.Instructions.Add(CilOpCodes.Add);
+            b.Instructions.Add(CilOpCodes.Stfld, ipField);
+            b.Instructions.Add(CilOpCodes.Ldloc, valLoc);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["ReadI4"].CilMethodBody = b;
+        }
+        {
+            // Push(int v): _stack[_sp] = v; _sp += 1;
+            var b = new CilMethodBody();
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldfld, stackField);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldfld, spField);
+            b.Instructions.Add(CilOpCodes.Ldarg_1);
+            b.Instructions.Add(CilOpCodes.Stelem_I4);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldfld, spField);
+            b.Instructions.Add(CilOpCodes.Ldc_I4_1);
+            b.Instructions.Add(CilOpCodes.Add);
+            b.Instructions.Add(CilOpCodes.Stfld, spField);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["Push"].CilMethodBody = b;
+        }
+        {
+            // Pop(): _sp -= 1; return _stack[_sp];
+            var b = new CilMethodBody();
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldfld, spField);
+            b.Instructions.Add(CilOpCodes.Ldc_I4_1);
+            b.Instructions.Add(CilOpCodes.Sub);
+            b.Instructions.Add(CilOpCodes.Stfld, spField);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldfld, stackField);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldfld, spField);
+            b.Instructions.Add(CilOpCodes.Ldelem_I4);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["Pop"].CilMethodBody = b;
+        }
+        {
+            // GetArg(): return (int)_args[ReadI4()];
+            var b = new CilMethodBody();
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldfld, argsField);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Call, helpers["ReadI4"]);
+            b.Instructions.Add(CilOpCodes.Ldelem_Ref);
+            b.Instructions.Add(CilOpCodes.Unbox_Any, int32Type.ToTypeDefOrRef());
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["GetArg"].CilMethodBody = b;
+        }
+        {
+            // GetLoc(): return _locals[ReadI4()];
+            var b = new CilMethodBody();
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldfld, localsField);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Call, helpers["ReadI4"]);
+            b.Instructions.Add(CilOpCodes.Ldelem_I4);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["GetLoc"].CilMethodBody = b;
+        }
+        {
+            // SetLoc(int v): _locals[ReadI4()] = v;
+            var b = new CilMethodBody();
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldfld, localsField);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Call, helpers["ReadI4"]);
+            b.Instructions.Add(CilOpCodes.Ldarg_1);
+            b.Instructions.Add(CilOpCodes.Stelem_I4);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["SetLoc"].CilMethodBody = b;
+        }
+        {
+            // Jump(): _ip = ReadI4();
+            var b = new CilMethodBody();
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Call, helpers["ReadI4"]);
+            b.Instructions.Add(CilOpCodes.Stfld, ipField);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["Jump"].CilMethodBody = b;
+        }
+        {
+            // JumpIfTrue(): int target = ReadI4(); if (Pop() != 0) _ip = target;
+            var b = new CilMethodBody { InitializeLocals = true };
+            var targetLoc = new CilLocalVariable(int32Type);
+            b.LocalVariables.Add(targetLoc);
+            var done = new CilInstruction(CilOpCodes.Ret);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Call, helpers["ReadI4"]);
+            b.Instructions.Add(CilOpCodes.Stloc, targetLoc);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Call, helpers["Pop"]);
+            b.Instructions.Add(CilOpCodes.Brfalse_S, done.CreateLabel());
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldloc, targetLoc);
+            b.Instructions.Add(CilOpCodes.Stfld, ipField);
+            b.Instructions.Add(done);
+            helpers["JumpIfTrue"].CilMethodBody = b;
+        }
+        {
+            // JumpIfFalse(): int target = ReadI4(); if (Pop() == 0) _ip = target;
+            var b = new CilMethodBody { InitializeLocals = true };
+            var targetLoc = new CilLocalVariable(int32Type);
+            b.LocalVariables.Add(targetLoc);
+            var done = new CilInstruction(CilOpCodes.Ret);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Call, helpers["ReadI4"]);
+            b.Instructions.Add(CilOpCodes.Stloc, targetLoc);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Call, helpers["Pop"]);
+            b.Instructions.Add(CilOpCodes.Brtrue_S, done.CreateLabel());
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldloc, targetLoc);
+            b.Instructions.Add(CilOpCodes.Stfld, ipField);
+            b.Instructions.Add(done);
+            helpers["JumpIfFalse"].CilMethodBody = b;
+        }
+        {
+            // Halt(): _halted = true;
+            var b = new CilMethodBody();
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldc_I4_1);
+            b.Instructions.Add(CilOpCodes.Stfld, haltedField);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["Halt"].CilMethodBody = b;
+        }
+        {
+            // VmNewObj(): Activator.CreateInstance(null);
+            var b = new CilMethodBody();
+            b.Instructions.Add(CilOpCodes.Ldnull);
+            b.Instructions.Add(CilOpCodes.Call, activatorCreate);
+            b.Instructions.Add(CilOpCodes.Pop);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["VmNewObj"].CilMethodBody = b;
+        }
+        {
+            // VmLdFld(): FieldInfo.GetValue(null);
+            var b = new CilMethodBody();
+            b.Instructions.Add(CilOpCodes.Ldnull);
+            b.Instructions.Add(CilOpCodes.Ldnull);
+            b.Instructions.Add(CilOpCodes.Callvirt, fieldInfoGetValue);
+            b.Instructions.Add(CilOpCodes.Pop);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["VmLdFld"].CilMethodBody = b;
+        }
+        {
+            // VmStFld(): FieldInfo.SetValue(null, null);
+            var b = new CilMethodBody();
+            b.Instructions.Add(CilOpCodes.Ldnull);
+            b.Instructions.Add(CilOpCodes.Ldnull);
+            b.Instructions.Add(CilOpCodes.Ldnull);
+            b.Instructions.Add(CilOpCodes.Callvirt, fieldInfoSetValue);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["VmStFld"].CilMethodBody = b;
+        }
+        {
+            // VmCall(): MethodBase.Invoke(null, null);
+            var b = new CilMethodBody();
+            b.Instructions.Add(CilOpCodes.Ldnull);
+            b.Instructions.Add(CilOpCodes.Ldnull);
+            b.Instructions.Add(CilOpCodes.Ldnull);
+            b.Instructions.Add(CilOpCodes.Callvirt, methodBaseInvoke);
+            b.Instructions.Add(CilOpCodes.Pop);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["VmCall"].CilMethodBody = b;
+        }
+        {
+            // VmCallVirt(): checks MethodBase.IsVirtual + MethodBase.Invoke(null, null);
+            var b = new CilMethodBody { InitializeLocals = true };
+            var mbLoc = new CilLocalVariable(methodBaseTypeSig);
+            b.LocalVariables.Add(mbLoc);
+            b.Instructions.Add(CilOpCodes.Ldloc, mbLoc);
+            b.Instructions.Add(CilOpCodes.Callvirt, methodBaseGetIsVirtual);
+            b.Instructions.Add(CilOpCodes.Pop);
+            b.Instructions.Add(CilOpCodes.Ldloc, mbLoc);
+            b.Instructions.Add(CilOpCodes.Ldnull);
+            b.Instructions.Add(CilOpCodes.Ldnull);
+            b.Instructions.Add(CilOpCodes.Callvirt, methodBaseInvoke);
+            b.Instructions.Add(CilOpCodes.Pop);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["VmCallVirt"].CilMethodBody = b;
+        }
+        {
+            // VmLdElemI4(): int idx = Pop(); Push(arr[idx]);
+            var b = new CilMethodBody { InitializeLocals = true };
+            var arrLoc = new CilLocalVariable(intArrayType);
+            var idxLoc = new CilLocalVariable(int32Type);
+            b.LocalVariables.Add(arrLoc);
+            b.LocalVariables.Add(idxLoc);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Call, helpers["Pop"]);
+            b.Instructions.Add(CilOpCodes.Stloc, idxLoc);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldloc, arrLoc);
+            b.Instructions.Add(CilOpCodes.Ldloc, idxLoc);
+            b.Instructions.Add(CilOpCodes.Ldelem_I4);
+            b.Instructions.Add(CilOpCodes.Call, helpers["Push"]);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["VmLdElemI4"].CilMethodBody = b;
+        }
+        {
+            // VmStElemI4(): int val = Pop(); int idx = Pop(); arr[idx] = val;
+            var b = new CilMethodBody { InitializeLocals = true };
+            var arrLoc = new CilLocalVariable(intArrayType);
+            var valLoc = new CilLocalVariable(int32Type);
+            var idxLoc = new CilLocalVariable(int32Type);
+            b.LocalVariables.Add(arrLoc);
+            b.LocalVariables.Add(valLoc);
+            b.LocalVariables.Add(idxLoc);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Call, helpers["Pop"]);
+            b.Instructions.Add(CilOpCodes.Stloc, valLoc);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Call, helpers["Pop"]);
+            b.Instructions.Add(CilOpCodes.Stloc, idxLoc);
+            b.Instructions.Add(CilOpCodes.Ldloc, arrLoc);
+            b.Instructions.Add(CilOpCodes.Ldloc, idxLoc);
+            b.Instructions.Add(CilOpCodes.Ldloc, valLoc);
+            b.Instructions.Add(CilOpCodes.Stelem_I4);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["VmStElemI4"].CilMethodBody = b;
+        }
+        {
+            // VmLdLen(): Push(arr.Length);
+            var b = new CilMethodBody { InitializeLocals = true };
+            var arrLoc = new CilLocalVariable(intArrayType);
+            b.LocalVariables.Add(arrLoc);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldloc, arrLoc);
+            b.Instructions.Add(CilOpCodes.Ldlen);
+            b.Instructions.Add(CilOpCodes.Conv_I4);
+            b.Instructions.Add(CilOpCodes.Call, helpers["Push"]);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["VmLdLen"].CilMethodBody = b;
+        }
+        {
+            // VmLeave(): _sp = 0; _ip = ReadI4();
+            var b = new CilMethodBody();
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldc_I4_0);
+            b.Instructions.Add(CilOpCodes.Stfld, spField);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Call, helpers["ReadI4"]);
+            b.Instructions.Add(CilOpCodes.Stfld, ipField);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["VmLeave"].CilMethodBody = b;
+        }
+        {
+            // VmEndFinally(): _ip = _ehStack.Pop();
+            var b = new CilMethodBody();
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldarg_0);
+            b.Instructions.Add(CilOpCodes.Ldfld, ehStackField);
+            b.Instructions.Add(CilOpCodes.Callvirt, intStackPop);
+            b.Instructions.Add(CilOpCodes.Stfld, ipField);
+            b.Instructions.Add(CilOpCodes.Ret);
+            helpers["VmEndFinally"].CilMethodBody = b;
         }
 
         // Create handler methods for every SemanticOp

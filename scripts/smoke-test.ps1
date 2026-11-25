@@ -19,12 +19,12 @@ $fixtureDir = Join-Path $ArtifactsDir "fixture-src"
 New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
 New-Item -ItemType Directory -Path $fixtureDir -Force | Out-Null
 
-# Build a self-authored .NET 7 class library fixture on the fly.
+# Build a self-authored .NET 8 class library fixture on the fly.
 # This fixture is NEVER executed; it is only passed as a static input file to de4vmp.
 $fixtureCsproj = @'
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net7.0</TargetFramework>
+    <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>

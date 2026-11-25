@@ -29,7 +29,7 @@ public class LoadFieldHandlerTransform : ITransform {
         if (instruction.Operand is not IFieldDescriptor fieldDescriptor)
             throw ExceptionService.ThrowInvalidOperand<VmpInstruction, IFieldDescriptor>(instruction);
 
-        if (fieldDescriptor.Resolve() is not { } fieldDefinition)
+        if (fieldDescriptor.Resolve(recompiler.RuntimeContext, out var fieldDefinition) != ResolutionStatus.Success || fieldDefinition is null)
             throw new VmpRecompilerException($"Unable to resolve fieldDefinition from {fieldDescriptor}");
 
         if (fieldDefinition.IsStatic) {

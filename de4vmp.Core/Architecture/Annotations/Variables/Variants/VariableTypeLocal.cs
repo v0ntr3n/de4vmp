@@ -1,5 +1,5 @@
 ﻿using AsmResolver.DotNet;
-using AsmResolver.DotNet.Signatures.Types;
+using AsmResolver.DotNet.Signatures;
 
 namespace de4vmp.Core.Architecture.Annotations.Variables.Variants;
 
@@ -10,7 +10,7 @@ public class VariableTypeLocal : IVariable {
 
     public ITypeDescriptor VariableType { get; }
 
-    public TypeSignature Signature => VariableType.ToTypeSignature();
+    public TypeSignature Signature => VariableType.ToTypeSignature(VariableType.ContextModule?.RuntimeContext);
     public bool IsArgument => false;
 
     public override string ToString() {

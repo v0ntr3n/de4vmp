@@ -40,6 +40,9 @@ public sealed class BoundedCilEmulator {
         public EmuArray(int length) => Elements = new object?[length];
     }
 
+    private sealed record EmuType(TypeDefinition Type);
+    private sealed record EmuMethodInfo(MethodDefinition Method);
+
     public EmulationSnapshot EmulateMethod(
         MethodDefinition method,
         object?[]? initialArgs = null,
@@ -220,21 +223,109 @@ public sealed class BoundedCilEmulator {
                     ip++;
                     break;
 
-                case CilCode.Add: { int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack)); stack.Push(unchecked(a + b)); ip++; break; }
-                case CilCode.Sub: { int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack)); stack.Push(unchecked(a - b)); ip++; break; }
-                case CilCode.Mul: { int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack)); stack.Push(unchecked(a * b)); ip++; break; }
-                case CilCode.Div: { int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack)); stack.Push(b != 0 ? a / b : 0); ip++; break; }
-                case CilCode.Div_Un: { uint b = ToU4(Pop(stack)); uint a = ToU4(Pop(stack)); stack.Push(b != 0 ? (int)(a / b) : 0); ip++; break; }
-                case CilCode.Rem: { int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack)); stack.Push(b != 0 ? a % b : 0); ip++; break; }
-                case CilCode.Rem_Un: { uint b = ToU4(Pop(stack)); uint a = ToU4(Pop(stack)); stack.Push(b != 0 ? (int)(a % b) : 0); ip++; break; }
-                case CilCode.Xor: { int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack)); stack.Push(a ^ b); ip++; break; }
-                case CilCode.And: { int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack)); stack.Push(a & b); ip++; break; }
-                case CilCode.Or:  { int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack)); stack.Push(a | b); ip++; break; }
-                case CilCode.Shl: { int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack)); stack.Push(a << (b & 31)); ip++; break; }
-                case CilCode.Shr: { int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack)); stack.Push(a >> (b & 31)); ip++; break; }
-                case CilCode.Shr_Un: { int b = ToI4(Pop(stack)); uint a = ToU4(Pop(stack)); stack.Push((int)(a >> (b & 31))); ip++; break; }
-                case CilCode.Neg: { int a = ToI4(Pop(stack)); stack.Push(unchecked(-a)); ip++; break; }
-                case CilCode.Not: { int a = ToI4(Pop(stack)); stack.Push(~a); ip++; break; }
+                case CilCode.Add: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    stack.Push(IsI64(a, b) ? (object)unchecked(ToI8(a) + ToI8(b)) : unchecked(ToI4(a) + ToI4(b)));
+                    ip++; break;
+                }
+                case CilCode.Sub: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    stack.Push(IsI64(a, b) ? (object)unchecked(ToI8(a) - ToI8(b)) : unchecked(ToI4(a) - ToI4(b)));
+                    ip++; break;
+                }
+                case CilCode.Mul: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    stack.Push(IsI64(a, b) ? (object)unchecked(ToI8(a) * ToI8(b)) : unchecked(ToI4(a) * ToI4(b)));
+                    ip++; break;
+                }
+                case CilCode.Div: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    if (IsI64(a, b)) {
+                        long lb = ToI8(b), la = ToI8(a);
+                        stack.Push(lb == 0 ? 0L : (la == long.MinValue && lb == -1 ? long.MinValue : la / lb));
+                    }
+                    else {
+                        int ib = ToI4(b), ia = ToI4(a);
+                        stack.Push(ib == 0 ? 0 : (ia == int.MinValue && ib == -1 ? int.MinValue : ia / ib));
+                    }
+                    ip++; break;
+                }
+                case CilCode.Div_Un: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    if (IsI64(a, b)) {
+                        ulong lb = ToU8(b), la = ToU8(a);
+                        stack.Push(lb != 0 ? unchecked((long)(la / lb)) : 0L);
+                    }
+                    else {
+                        uint ib = ToU4(b), ia = ToU4(a);
+                        stack.Push(ib != 0 ? unchecked((int)(ia / ib)) : 0);
+                    }
+                    ip++; break;
+                }
+                case CilCode.Rem: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    if (IsI64(a, b)) {
+                        long lb = ToI8(b), la = ToI8(a);
+                        stack.Push(lb == 0 ? 0L : (la == long.MinValue && lb == -1 ? 0L : la % lb));
+                    }
+                    else {
+                        int ib = ToI4(b), ia = ToI4(a);
+                        stack.Push(ib == 0 ? 0 : (ia == int.MinValue && ib == -1 ? 0 : ia % ib));
+                    }
+                    ip++; break;
+                }
+                case CilCode.Rem_Un: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    if (IsI64(a, b)) {
+                        ulong lb = ToU8(b), la = ToU8(a);
+                        stack.Push(lb != 0 ? unchecked((long)(la % lb)) : 0L);
+                    }
+                    else {
+                        uint ib = ToU4(b), ia = ToU4(a);
+                        stack.Push(ib != 0 ? unchecked((int)(ia % ib)) : 0);
+                    }
+                    ip++; break;
+                }
+                case CilCode.Xor: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    stack.Push(IsI64(a, b) ? (object)(ToI8(a) ^ ToI8(b)) : (ToI4(a) ^ ToI4(b)));
+                    ip++; break;
+                }
+                case CilCode.And: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    stack.Push(IsI64(a, b) ? (object)(ToI8(a) & ToI8(b)) : (ToI4(a) & ToI4(b)));
+                    ip++; break;
+                }
+                case CilCode.Or: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    stack.Push(IsI64(a, b) ? (object)(ToI8(a) | ToI8(b)) : (ToI4(a) | ToI4(b)));
+                    ip++; break;
+                }
+                case CilCode.Shl: {
+                    int b = ToI4(Pop(stack)); var a = Pop(stack);
+                    stack.Push(IsI64(a) ? (object)(ToI8(a) << (b & 63)) : (ToI4(a) << (b & 31)));
+                    ip++; break;
+                }
+                case CilCode.Shr: {
+                    int b = ToI4(Pop(stack)); var a = Pop(stack);
+                    stack.Push(IsI64(a) ? (object)(ToI8(a) >> (b & 63)) : (ToI4(a) >> (b & 31)));
+                    ip++; break;
+                }
+                case CilCode.Shr_Un: {
+                    int b = ToI4(Pop(stack)); var a = Pop(stack);
+                    stack.Push(IsI64(a) ? (object)unchecked((long)(ToU8(a) >> (b & 63))) : unchecked((int)(ToU4(a) >> (b & 31))));
+                    ip++; break;
+                }
+                case CilCode.Neg: {
+                    var a = Pop(stack);
+                    stack.Push(IsI64(a) ? (object)unchecked(-ToI8(a)) : unchecked(-ToI4(a)));
+                    ip++; break;
+                }
+                case CilCode.Not: {
+                    var a = Pop(stack);
+                    stack.Push(IsI64(a) ? (object)(~ToI8(a)) : (~ToI4(a)));
+                    ip++; break;
+                }
 
                 case CilCode.Conv_I1: stack.Push((int)(sbyte)ToI4(Pop(stack))); ip++; break;
                 case CilCode.Conv_U1: stack.Push((int)(byte)ToI4(Pop(stack))); ip++; break;
@@ -242,14 +333,30 @@ public sealed class BoundedCilEmulator {
                 case CilCode.Conv_U2: stack.Push((int)(ushort)ToI4(Pop(stack))); ip++; break;
                 case CilCode.Conv_I4:
                 case CilCode.Conv_U4: stack.Push(ToI4(Pop(stack))); ip++; break;
-                case CilCode.Conv_I8: stack.Push((long)ToI4(Pop(stack))); ip++; break;
-                case CilCode.Conv_U8: stack.Push((long)ToU4(Pop(stack))); ip++; break;
+                case CilCode.Conv_I8: { var v = Pop(stack); stack.Push(IsI64(v) ? ToI8(v) : (long)ToI4(v)); ip++; break; }
+                case CilCode.Conv_U8: { var v = Pop(stack); stack.Push(IsI64(v) ? ToI8(v) : (long)(ulong)ToU4(v)); ip++; break; }
 
-                case CilCode.Ceq: { var b = Pop(stack); var a = Pop(stack); stack.Push(Equals(a, b) ? 1 : 0); ip++; break; }
-                case CilCode.Clt: { int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack)); stack.Push(a < b ? 1 : 0); ip++; break; }
-                case CilCode.Clt_Un: { uint b = ToU4(Pop(stack)); uint a = ToU4(Pop(stack)); stack.Push(a < b ? 1 : 0); ip++; break; }
-                case CilCode.Cgt: { int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack)); stack.Push(a > b ? 1 : 0); ip++; break; }
-                case CilCode.Cgt_Un: { uint b = ToU4(Pop(stack)); uint a = ToU4(Pop(stack)); stack.Push(a > b ? 1 : 0); ip++; break; }
+                case CilCode.Ceq: { var b = Pop(stack); var a = Pop(stack); stack.Push(AreEqual(a, b) ? 1 : 0); ip++; break; }
+                case CilCode.Clt: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    stack.Push((IsI64(a, b) ? ToI8(a) < ToI8(b) : ToI4(a) < ToI4(b)) ? 1 : 0);
+                    ip++; break;
+                }
+                case CilCode.Clt_Un: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    stack.Push((IsI64(a, b) ? ToU8(a) < ToU8(b) : ToU4(a) < ToU4(b)) ? 1 : 0);
+                    ip++; break;
+                }
+                case CilCode.Cgt: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    stack.Push((IsI64(a, b) ? ToI8(a) > ToI8(b) : ToI4(a) > ToI4(b)) ? 1 : 0);
+                    ip++; break;
+                }
+                case CilCode.Cgt_Un: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    stack.Push((IsI64(a, b) ? ToU8(a) > ToU8(b) : ToU4(a) > ToU4(b)) ? 1 : 0);
+                    ip++; break;
+                }
 
                 case CilCode.Br:
                 case CilCode.Br_S:
@@ -272,38 +379,70 @@ public sealed class BoundedCilEmulator {
                 }
                 case CilCode.Beq:
                 case CilCode.Beq_S: {
-                    int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack));
-                    ip = a == b ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
+                    var b = Pop(stack); var a = Pop(stack);
+                    ip = AreEqual(a, b) ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
                     break;
                 }
                 case CilCode.Bne_Un:
                 case CilCode.Bne_Un_S: {
-                    int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack));
-                    ip = a != b ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
+                    var b = Pop(stack); var a = Pop(stack);
+                    ip = !AreEqual(a, b) ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
                     break;
                 }
                 case CilCode.Blt:
                 case CilCode.Blt_S: {
-                    int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack));
-                    ip = a < b ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
+                    var b = Pop(stack); var a = Pop(stack);
+                    bool cond = IsI64(a, b) ? ToI8(a) < ToI8(b) : ToI4(a) < ToI4(b);
+                    ip = cond ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
                     break;
                 }
                 case CilCode.Bgt:
                 case CilCode.Bgt_S: {
-                    int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack));
-                    ip = a > b ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
+                    var b = Pop(stack); var a = Pop(stack);
+                    bool cond = IsI64(a, b) ? ToI8(a) > ToI8(b) : ToI4(a) > ToI4(b);
+                    ip = cond ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
                     break;
                 }
                 case CilCode.Ble:
                 case CilCode.Ble_S: {
-                    int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack));
-                    ip = a <= b ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
+                    var b = Pop(stack); var a = Pop(stack);
+                    bool cond = IsI64(a, b) ? ToI8(a) <= ToI8(b) : ToI4(a) <= ToI4(b);
+                    ip = cond ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
                     break;
                 }
                 case CilCode.Bge:
                 case CilCode.Bge_S: {
-                    int b = ToI4(Pop(stack)); int a = ToI4(Pop(stack));
-                    ip = a >= b ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
+                    var b = Pop(stack); var a = Pop(stack);
+                    bool cond = IsI64(a, b) ? ToI8(a) >= ToI8(b) : ToI4(a) >= ToI4(b);
+                    ip = cond ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
+                    break;
+                }
+                case CilCode.Blt_Un:
+                case CilCode.Blt_Un_S: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    bool cond = IsI64(a, b) ? ToU8(a) < ToU8(b) : ToU4(a) < ToU4(b);
+                    ip = cond ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
+                    break;
+                }
+                case CilCode.Bgt_Un:
+                case CilCode.Bgt_Un_S: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    bool cond = IsI64(a, b) ? ToU8(a) > ToU8(b) : ToU4(a) > ToU4(b);
+                    ip = cond ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
+                    break;
+                }
+                case CilCode.Ble_Un:
+                case CilCode.Ble_Un_S: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    bool cond = IsI64(a, b) ? ToU8(a) <= ToU8(b) : ToU4(a) <= ToU4(b);
+                    ip = cond ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
+                    break;
+                }
+                case CilCode.Bge_Un:
+                case CilCode.Bge_Un_S: {
+                    var b = Pop(stack); var a = Pop(stack);
+                    bool cond = IsI64(a, b) ? ToU8(a) >= ToU8(b) : ToU4(a) >= ToU4(b);
+                    ip = cond ? ResolveLabel(insns, (ICilLabel)ins.Operand!) : ip + 1;
                     break;
                 }
                 case CilCode.Switch: {
@@ -445,17 +584,77 @@ public sealed class BoundedCilEmulator {
                         for (int b = 0; b < Math.Min(raw.Length, targetArr.Elements.Length); b++)
                             targetArr.Elements[b] = (int)raw[b];
                     }
+                    else if (declName == "System.Object" && calleeName == ".ctor" && pCount == 0) {
+                        // Allow System.Object::.ctor cleanly in instance constructors.
+                    }
+                    else if (declName == "System.Type" && calleeName == "GetTypeFromHandle" && pCount == 1) {
+                        var td = callArgs[0] as TypeDefinition
+                            ?? (callArgs[0] as ITypeDefOrRef)?.Resolve(method.DeclaringModule?.RuntimeContext);
+                        stack.Push(td is not null ? new EmuType(td) : null);
+                    }
+                    else if (declName == "System.Type" && calleeName == "GetMethods" && pCount is 0 or 1 && receiver is EmuType emuType) {
+                        // Default BindingFlags: Public (0x10) | Instance (0x04) | Static (0x08)
+                        int flags = pCount == 1 ? ToI4(callArgs[0]) : (0x10 | 0x04 | 0x08);
+                        bool wantInstance = (flags & 0x04) != 0;
+                        bool wantStatic = (flags & 0x08) != 0;
+                        bool wantPublic = (flags & 0x10) != 0;
+                        bool wantNonPublic = (flags & 0x20) != 0;
+
+                        var matched = emuType.Type.Methods
+                            .Where(m => !m.IsConstructor &&
+                                        (m.IsStatic ? wantStatic : wantInstance) &&
+                                        (m.IsPublic ? wantPublic : wantNonPublic))
+                            .ToList();
+
+                        var arr = new EmuArray(matched.Count);
+                        for (int mIdx = 0; mIdx < matched.Count; mIdx++)
+                            arr.Elements[mIdx] = new EmuMethodInfo(matched[mIdx]);
+                        stack.Push(arr);
+                    }
+                    else if (declName == "System.Delegate" && calleeName == "CreateDelegate" && pCount is >= 2 and <= 4) {
+                        EmuType? delEmuType = callArgs[0] as EmuType;
+                        EmuMethodInfo? targetMi = null;
+                        bool boundToFirstArg = false;
+
+                        if (pCount == 2 || (pCount == 3 && callArgs[1] is EmuMethodInfo)) {
+                            targetMi = callArgs[1] as EmuMethodInfo;
+                        }
+                        else if (pCount >= 3 && callArgs[2] is EmuMethodInfo mi3) {
+                            targetMi = mi3;
+                            boundToFirstArg = callArgs[1] is not null;
+                        }
+
+                        if (delEmuType is not null && targetMi is not null &&
+                            IsDelegateSignatureCompatible(delEmuType.Type, targetMi.Method, boundToFirstArg)) {
+                            stack.Push(new EmuObject(delEmuType.Type.FullName) { DelegateTarget = targetMi.Method });
+                        }
+                        else {
+                            stack.Push(null);
+                        }
+                    }
+                    else if ((declName is "System.Reflection.MemberInfo" or "System.Reflection.MethodBase" or "System.Reflection.MethodInfo") &&
+                             calleeName == "get_MetadataToken" && pCount == 0) {
+                        int token = receiver switch {
+                            EmuMethodInfo emi => emi.Method.MetadataToken.ToInt32(),
+                            EmuType et => et.Type.MetadataToken.ToInt32(),
+                            _ => 0
+                        };
+                        stack.Push(token);
+                    }
                     else if (callee is MethodDefinition localMethod && localMethod.CilMethodBody is not null &&
                              localMethod.DeclaringType == method.DeclaringType &&
                              !localMethod.IsConstructor) {
                         var subArgs = hasThis ? new[] { receiver }.Concat(callArgs).ToArray() : callArgs;
-                        ExecuteFrame(localMethod, subArgs, staticFields, capturedHandlers, ref steps, depth + 1, out var subRet, out _);
+                        if (!ExecuteFrame(localMethod, subArgs, staticFields, capturedHandlers, ref steps, depth + 1, out var subRet, out var subStop)) {
+                            stopReason = subStop;
+                            return false;
+                        }
                         if (callee.Signature?.ReturnsValue == true)
                             stack.Push(subRet);
                     }
                     else {
-                        if (callee.Signature?.ReturnsValue == true)
-                            stack.Push(0);
+                        stopReason = $"Unmodeled call: {callee.FullName}";
+                        return false;
                     }
 
                     ip++;
@@ -477,6 +676,23 @@ public sealed class BoundedCilEmulator {
 
     private static object? Pop(Stack<object?> stack) => stack.Count > 0 ? stack.Pop() : 0;
 
+    private static bool IsI64(object? a) => a is long or ulong;
+
+    private static bool IsI64(object? a, object? b) => a is long or ulong || b is long or ulong;
+
+    private static bool IsNumeric(object? v) =>
+        v is int or uint or long or ulong or short or ushort or byte or sbyte or bool;
+
+    private static bool AreEqual(object? a, object? b) {
+        if (ReferenceEquals(a, b))
+            return true;
+        if (a is null || b is null)
+            return false;
+        if (IsNumeric(a) && IsNumeric(b))
+            return IsI64(a, b) ? ToI8(a) == ToI8(b) : ToI4(a) == ToI4(b);
+        return Equals(a, b);
+    }
+
     private static int ToI4(object? v) => v switch {
         int i => i,
         uint u => unchecked((int)u),
@@ -485,15 +701,46 @@ public sealed class BoundedCilEmulator {
         short s => s,
         ushort us => us,
         long l => unchecked((int)l),
+        ulong ul => unchecked((int)ul),
         bool bl => bl ? 1 : 0,
         _ => 0
     };
 
     private static uint ToU4(object? v) => unchecked((uint)ToI4(v));
 
+    private static long ToI8(object? v) => v switch {
+        long l => l,
+        ulong ul => unchecked((long)ul),
+        int i => i,
+        uint u => u,
+        byte b => b,
+        sbyte sb => sb,
+        short s => s,
+        ushort us => us,
+        bool bl => bl ? 1L : 0L,
+        _ => 0L
+    };
+
+    private static ulong ToU8(object? v) => v switch {
+        ulong ul => ul,
+        long l => unchecked((ulong)l),
+        uint u => u,
+        int i => unchecked((ulong)(uint)i),
+        byte b => b,
+        sbyte sb => unchecked((ulong)(uint)(int)sb),
+        short s => unchecked((ulong)(uint)(int)s),
+        ushort us => us,
+        bool bl => bl ? 1UL : 0UL,
+        _ => 0UL
+    };
+
     private static int GetArgIndex(MethodDefinition method, object? operand) {
-        if (operand is AsmResolver.DotNet.Collections.Parameter p)
+        if (operand is AsmResolver.DotNet.Collections.Parameter p) {
+            // In AsmResolver 6.0.0, p.MethodSignatureIndex is the CIL argument slot (0 = 'this' for
+            // instance methods, 1..N = declared parameters; 0..N-1 for static methods), whereas
+            // p.Index is the 0-based index into method.Parameters (-1 for ThisParameter).
             return p.MethodSignatureIndex;
+        }
         return 0;
     }
 
@@ -505,5 +752,39 @@ public sealed class BoundedCilEmulator {
                 return i;
         }
         return -1;
+    }
+
+    private static bool IsDelegateSignatureCompatible(TypeDefinition delType, MethodDefinition target, bool boundToFirstArg) {
+        var invoke = delType.Methods.FirstOrDefault(m => m.Name == "Invoke");
+        if (invoke?.Signature is null || target.Signature is null)
+            return false;
+
+        if (invoke.Signature.ReturnType.FullName != target.Signature.ReturnType.FullName)
+            return false;
+
+        var invokeParams = invoke.Signature.ParameterTypes;
+        var targetParams = target.Signature.ParameterTypes;
+
+        if (target.IsStatic || boundToFirstArg) {
+            if (invokeParams.Count != targetParams.Count)
+                return false;
+            for (int i = 0; i < targetParams.Count; i++) {
+                if (invokeParams[i].FullName != targetParams[i].FullName)
+                    return false;
+            }
+            return true;
+        }
+
+        // Open instance delegate: Invoke(DeclaringType instance, ...targetParams)
+        if (invokeParams.Count != targetParams.Count + 1)
+            return false;
+        string? declFullName = target.DeclaringType?.FullName;
+        if (invokeParams[0].FullName != declFullName && invokeParams[0].FullName != "System.Object")
+            return false;
+        for (int i = 0; i < targetParams.Count; i++) {
+            if (invokeParams[i + 1].FullName != targetParams[i].FullName)
+                return false;
+        }
+        return true;
     }
 }

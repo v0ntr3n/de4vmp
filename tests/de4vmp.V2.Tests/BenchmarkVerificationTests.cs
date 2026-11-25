@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.Loader;
 using AsmResolver.DotNet;
@@ -57,8 +58,9 @@ public sealed class BenchmarkVerificationTests {
             Assert.True(truth.VirtualizedMethods.Count == metrics.MethodsDevirtualized,
                 $"Expected {truth.VirtualizedMethods.Count} devirtualized methods, got {metrics.MethodsDevirtualized}. Diagnostics:\n{string.Join("\n", metrics.Diagnostics)}");
 
-            // 6. Write devirtualized PE assembly and verify it loads + executes bit-identically to ReferenceSuite!
+            // 6. Write devirtualized PE assembly, run dotnet-ilverify if installed (required in CI), and verify bit-identical execution!
             module.Write(devirtPath);
+            VerifyWithIlVerify(devirtPath);
 
             var alc = new CollectibleContext();
             try {
@@ -191,5 +193,63 @@ public sealed class BenchmarkVerificationTests {
             Assert.Equal(ReferenceSuite.TryFinallyAccumulate(10, 5), (int)tryFinally.Invoke(null, [10, 5])!);
             Assert.Equal(ReferenceSuite.TryFinallyAccumulate(-3, 8), (int)tryFinally.Invoke(null, [-3, 8])!);
         }
+    }
+
+    private static void VerifyWithIlVerify(string assemblyPath) {
+        bool required = string.Equals(Environment.GetEnvironmentVariable("DE4VMP_REQUIRE_ILVERIFY"), "1", StringComparison.Ordinal);
+        string? ilVerifyPath = FindIlVerifyExecutable();
+        if (ilVerifyPath is null) {
+            if (required) {
+                Assert.Fail("DE4VMP_REQUIRE_ILVERIFY=1 is set, but 'ilverify' (dotnet-ilverify) was not found on PATH or in ~/.dotnet/tools.");
+            }
+            return;
+        }
+
+        string runtimeDir = Path.GetDirectoryName(typeof(object).Assembly.Location)!;
+        string testBinDir = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+        var psi = new ProcessStartInfo {
+            FileName = ilVerifyPath,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        psi.ArgumentList.Add(assemblyPath);
+        psi.ArgumentList.Add("-s");
+        psi.ArgumentList.Add("System.Private.CoreLib");
+        psi.ArgumentList.Add("-r");
+        psi.ArgumentList.Add(Path.Combine(runtimeDir, "*.dll"));
+        psi.ArgumentList.Add("-r");
+        psi.ArgumentList.Add(Path.Combine(testBinDir, "*.dll"));
+        psi.ArgumentList.Add("-i");
+        psi.ArgumentList.Add(@"SyntheticFixture\.VirtualizedTargets");
+
+        using var proc = Process.Start(psi)!;
+        string stdout = proc.StandardOutput.ReadToEnd();
+        string stderr = proc.StandardError.ReadToEnd();
+        proc.WaitForExit(30_000);
+
+        Assert.True(proc.ExitCode == 0,
+            $"dotnet-ilverify failed (exit {proc.ExitCode}) on {assemblyPath}:\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+    }
+
+    private static string? FindIlVerifyExecutable() {
+        string exeName = OperatingSystem.IsWindows() ? "ilverify.exe" : "ilverify";
+        string toolsDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotnet", "tools");
+        string userTool = Path.Combine(toolsDir, exeName);
+        if (File.Exists(userTool))
+            return userTool;
+
+        string? pathEnv = Environment.GetEnvironmentVariable("PATH");
+        if (!string.IsNullOrEmpty(pathEnv)) {
+            foreach (string dir in pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)) {
+                string candidate = Path.Combine(dir.Trim(), exeName);
+                if (File.Exists(candidate))
+                    return candidate;
+            }
+        }
+
+        return null;
     }
 }

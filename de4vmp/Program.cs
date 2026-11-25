@@ -1,7 +1,10 @@
 ﻿using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.ExceptionServices;
+using AsmResolver.DotNet;
 using de4vmp;
 using de4vmp.Core;
+using de4vmp.V2.Translation;
 using Figgle;
 using Spectre.Console;
 
@@ -79,9 +82,31 @@ try {
 
     var workTask = Task.Run(() => {
         cts.Token.ThrowIfCancellationRequested();
-        var context = new DevirtualizationContext(resolvedInput, resolvedOutput);
-        var devirtualizer = new Devirtualizer(logger);
-        devirtualizer.Devirtualize(context, cts.Token);
+        switch (options.Engine) {
+            case EngineMode.V1:
+                RunV1(resolvedInput, resolvedOutput, logger, cts.Token);
+                break;
+
+            case EngineMode.V2:
+                RunV2(resolvedInput, resolvedOutput, logger, tag, cts.Token);
+                break;
+
+            case EngineMode.Auto:
+            default:
+                try {
+                    RunV1(resolvedInput, resolvedOutput, logger, cts.Token);
+                }
+                catch (DevirtualizationException v1Exception) {
+                    logger.Warning(tag, $"V1 engine did not match ({v1Exception.Message}); falling back to V2 engine...");
+                    try {
+                        RunV2(resolvedInput, resolvedOutput, logger, tag, cts.Token);
+                    }
+                    catch (DevirtualizationException) {
+                        ExceptionDispatchInfo.Capture(v1Exception).Throw();
+                    }
+                }
+                break;
+        }
     }, cts.Token);
 
     if (options.Timeout is { } limit) {
@@ -220,6 +245,44 @@ static bool TryValidatePaths(
 
     error = null;
     return true;
+}
+
+static void RunV1(string resolvedInput, string? resolvedOutput, ILogger logger, CancellationToken cancellationToken) {
+    var context = new DevirtualizationContext(resolvedInput, resolvedOutput);
+    var devirtualizer = new Devirtualizer(logger);
+    devirtualizer.Devirtualize(context, cancellationToken);
+}
+
+static void RunV2(string resolvedInput, string? resolvedOutput, ILogger logger, string tag, CancellationToken cancellationToken) {
+    cancellationToken.ThrowIfCancellationRequested();
+    logger.Information(tag, "Running V2 devirtualization engine...");
+    var module = ModuleDefinition.FromFile(resolvedInput);
+    var devirtualizer = new V2Devirtualizer();
+    var metrics = devirtualizer.Devirtualize(module);
+    cancellationToken.ThrowIfCancellationRequested();
+
+    if (metrics.MethodsDevirtualized <= 0) {
+        string details = metrics.Diagnostics.Count > 0
+            ? string.Join(" | ", metrics.Diagnostics)
+            : "No virtualized methods were devirtualized.";
+        throw new DevirtualizationException($"V2 engine devirtualized 0 methods: {details}");
+    }
+
+    string outputPath = !string.IsNullOrWhiteSpace(resolvedOutput)
+        ? resolvedOutput
+        : Path.Combine(
+            Path.GetDirectoryName(resolvedInput) ?? string.Empty,
+            $"{Path.GetFileNameWithoutExtension(resolvedInput)}_devirtualized{Path.GetExtension(resolvedInput)}");
+
+    string? outputDir = Path.GetDirectoryName(outputPath);
+    if (!string.IsNullOrEmpty(outputDir) && !Directory.Exists(outputDir))
+        Directory.CreateDirectory(outputDir);
+
+    module.Write(outputPath);
+    logger.Information(tag,
+        $"V2 devirtualized {metrics.MethodsDevirtualized}/{metrics.MethodsDiscovered} method(s) " +
+        $"({metrics.HandlersClassified}/{metrics.HandlersDiscovered} handlers classified, " +
+        $"{metrics.CffSwitchesEliminated} CFF switches eliminated) -> {outputPath}");
 }
 
 static void PauseIfInteractive(IAnsiConsole console, bool isInteractive) {

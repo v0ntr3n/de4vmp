@@ -43,15 +43,16 @@ public sealed class AdversarialAuditTests {
     ];
 
     // =========================================================================
-    // 1. Obfuscated / Renamed VM Helper Methods
+    // 1. Obfuscated / Renamed VM Helper Methods & Reflection MetadataToken Discovery
     // =========================================================================
 
     [Fact]
-    public void RenamedVmHelpers_StructuralHandlersFailClosedToUnknown() {
+    public void RenamedVmHelpers_Achieves100PercentClassificationAndDifferentialEquivalence() {
         string workDir = CreateTempDir("renamed-helpers");
         try {
             string virtPath = Path.Combine(workDir, "Virt_Tier2.dll");
             string obfPath = Path.Combine(workDir, "Virt_Tier2_RenamedHelpers.dll");
+            string devirtPath = Path.Combine(workDir, "Devirt_Tier2_RenamedHelpers.dll");
 
             var truth = new SyntheticVmCompiler().Generate(SyntheticTier.Tier2_32BitDictEncryptedPolymorphic, virtPath);
             var module = ModuleDefinition.FromFile(virtPath);
@@ -73,32 +74,60 @@ public sealed class AdversarialAuditTests {
 
             var metrics = new V2Devirtualizer().Devirtualize(reloaded);
 
-            // All 33 handlers are still discovered via bounded emulation of VmRuntime..ctor
+            // 100% handler discovery and 100% name-invariant classification (33/33, 0 Unknown)
             Assert.Equal(truth.OpcodeMap.Count, metrics.HandlersDiscovered);
-
-            int expectedProbed = truth.OpcodeMap.Values.Count(op => PureProbedOps.Contains(op));
-            int expectedStructural = truth.OpcodeMap.Count - expectedProbed;
-
-            // Pure arithmetic/comparison handlers still classify via behavioral I/O probing on H_XX_Core
-            Assert.Equal(expectedProbed, metrics.HandlersClassified);
-
-            // ALL structural handlers fail closed to SemanticOp.Unknown because HandlerSemanticClassifier
-            // hardcodes English helper names ("ReadI4", "Push", "Pop", "Jump", "Halt", etc.)
-            Assert.Equal(expectedStructural, metrics.UnknownHandlers);
+            Assert.Equal(truth.OpcodeMap.Count, metrics.HandlersClassified);
+            Assert.Equal(0, metrics.UnknownHandlers);
 
             foreach (var (key, expectedOp) in truth.OpcodeMap) {
                 Assert.True(metrics.Handlers.TryGetValue(key, out var resolved));
-                if (PureProbedOps.Contains(expectedOp)) {
-                    Assert.Equal(expectedOp, resolved!.SemanticOp);
-                }
-                else {
-                    Assert.Equal(SemanticOp.Unknown, resolved!.SemanticOp);
-                }
+                Assert.Equal(expectedOp, resolved!.SemanticOp);
             }
 
-            // Call sites are still discovered, but 0 methods can be devirtualized (fail-closed)
+            // 100% method discovery & devirtualization (6/6)
             Assert.Equal(truth.VirtualizedMethods.Count, metrics.MethodsDiscovered);
-            Assert.Equal(0, metrics.MethodsDevirtualized);
+            Assert.Equal(truth.VirtualizedMethods.Count, metrics.MethodsDevirtualized);
+
+            // Verify 100% differential behavioral equivalence against ReferenceSuite
+            reloaded.Write(devirtPath);
+            VerifyTier2DifferentialEquivalence(devirtPath);
+        }
+        finally {
+            SafeDeleteDir(workDir);
+        }
+    }
+
+    [Fact]
+    public void ReflectionMetadataTokenDiscovery_GClass105CctorLoop_Discovers100PercentOfHandlers() {
+        string workDir = CreateTempDir("reflection-token-vm");
+        try {
+            string dllPath = Path.Combine(workDir, "ReflectionTokenVm.dll");
+            var (module, expectedHandlerNames) = BuildReflectionMetadataTokenVmModule();
+
+            // Write and reload so every method has its real ECMA-335 0x0600XXXX MetadataToken
+            module.Write(dllPath);
+            var reloaded = ModuleDefinition.FromFile(dllPath);
+
+            var vmType = reloaded.TopLevelTypes.First(t => t.Name == "GClass105");
+            var expectedByToken = new Dictionary<uint, string>();
+            foreach (string hName in expectedHandlerNames) {
+                var hm = vmType.Methods.First(m => m.Name == hName);
+                uint tok = hm.MetadataToken.ToUInt32();
+                Assert.NotEqual(0u, tok);
+                expectedByToken[tok] = hName;
+            }
+
+            var diagnostics = new List<string>();
+            var discovery = new V2Devirtualizer().DiscoverVm(reloaded, diagnostics);
+
+            Assert.NotNull(discovery);
+            Assert.Equal(expectedByToken.Count, discovery!.RawHandlers.Count);
+
+            foreach (var (tok, expectedName) in expectedByToken) {
+                Assert.True(discovery.RawHandlers.TryGetValue(tok, out var discoveredMethod),
+                    $"Expected handler token 0x{tok:X8} ({expectedName}) to be discovered.");
+                Assert.Equal(expectedName, discoveredMethod!.Name!.Value);
+            }
         }
         finally {
             SafeDeleteDir(workDir);
@@ -194,16 +223,17 @@ public sealed class AdversarialAuditTests {
     }
 
     [Fact]
-    public void BoundedEmulator_CrossTypeHelperRegistration_SilentlySkipsAndCapturesZeroHandlers() {
+    public void BoundedEmulator_CrossTypeHelperRegistration_FailsClosedOnUnmodeledCall() {
         var (module, vmCtor) = BuildVmCtorWithCrossTypeHelperRegistration();
         var emulator = new BoundedCilEmulator();
 
         var snap = emulator.EmulateMethod(vmCtor);
 
-        // BoundedCilEmulator only steps into callees on the SAME DeclaringType (line 449).
-        // Calls to another type's helper are silently stubbed with 0, so CompletedNormally is true
-        // while 0 handlers are captured!
-        Assert.True(snap.CompletedNormally);
+        // BoundedCilEmulator only steps into callees on the SAME DeclaringType and allowlisted BCL hooks.
+        // Calls to unmodeled cross-type helpers must fail closed instead of silently returning 0.
+        Assert.False(snap.CompletedNormally);
+        Assert.NotNull(snap.StopReason);
+        Assert.Contains("Unmodeled call", snap.StopReason!, StringComparison.OrdinalIgnoreCase);
         Assert.Empty(snap.CapturedHandlers);
     }
 
@@ -211,7 +241,7 @@ public sealed class AdversarialAuditTests {
     [InlineData("Add", 0x0000_0001_0000_0010L, 0x0000_0002_0000_0020L, 0x0000_0003_0000_0030L)]
     [InlineData("Sub", 0x0000_0005_0000_0030L, 0x0000_0002_0000_0010L, 0x0000_0003_0000_0020L)]
     [InlineData("Xor", 0x0000_0003_0000_000FL, 0x0000_0001_0000_00F0L, 0x0000_0002_0000_00FFL)]
-    public void BoundedEmulator_Int64Arithmetic_SilentlyTruncatesToInt32(string opName, long a, long b, long expectedTrueInt64) {
+    public void BoundedEmulator_Int64Arithmetic_PreservesFull64BitResult(string opName, long a, long b, long expectedTrueInt64) {
         CilOpCode opCode = opName switch {
             "Add" => CilOpCodes.Add,
             "Sub" => CilOpCodes.Sub,
@@ -224,13 +254,49 @@ public sealed class AdversarialAuditTests {
 
         var snap = emulator.EmulateMethod(method);
 
-        // Emulator does NOT fail closed on 64-bit arithmetic; it completes normally
         Assert.True(snap.CompletedNormally);
+        long actual = Assert.IsType<long>(snap.ReturnValue);
+        Assert.Equal(expectedTrueInt64, actual);
+    }
 
-        // Empirically proves BoundedCilEmulator truncates Int64 operands via ToI4() and returns Int32!
-        int truncatedActual = Assert.IsType<int>(snap.ReturnValue);
-        Assert.Equal(unchecked((int)expectedTrueInt64), truncatedActual);
-        Assert.NotEqual(expectedTrueInt64, (long)truncatedActual);
+    [Fact]
+    public void BoundedEmulator_InstanceMethodLdargAndObjectBeq_BehavesAccurately() {
+        var module = CreateFreshNet8Module("InstanceLdargBeq");
+        var importer = module.DefaultImporter;
+        var corlib = module.CorLibTypeFactory;
+
+        var type = new TypeDefinition("AdversarialVm", "InstanceHelper", TypeAttributes.Public | TypeAttributes.Class,
+            importer.ImportType(typeof(object)));
+        module.TopLevelTypes.Add(type);
+
+        // Instance method: int CompareAndRead(object obj, int val) => obj == null ? -1 : val;
+        var method = new MethodDefinition("CompareAndRead", MethodAttributes.Public | MethodAttributes.HideBySig,
+            MethodSignature.CreateInstance(corlib.Int32, [corlib.Object, corlib.Int32]));
+        type.Methods.Add(method);
+
+        var body = new CilMethodBody();
+        var retNeg = new CilInstruction(CilOpCodes.Ldc_I4_M1);
+        // Use long-form Ldarg (which goes through GetArgIndex) on both parameter 0 (obj) and parameter 1 (val)
+        body.Instructions.Add(CilOpCodes.Ldarg, method.Parameters[0]);
+        body.Instructions.Add(CilOpCodes.Ldnull);
+        body.Instructions.Add(CilOpCodes.Beq, retNeg.CreateLabel());
+        body.Instructions.Add(CilOpCodes.Ldarg, method.Parameters[1]);
+        body.Instructions.Add(CilOpCodes.Ret);
+        body.Instructions.Add(retNeg);
+        body.Instructions.Add(CilOpCodes.Ret);
+        method.CilMethodBody = body;
+
+        var emulator = new BoundedCilEmulator();
+
+        // Non-null object != null -> must return val (42), not -1!
+        var snapNonNull = emulator.EmulateMethod(method, initialArgs: [new object(), 42]);
+        Assert.True(snapNonNull.CompletedNormally);
+        Assert.Equal(42, Assert.IsType<int>(snapNonNull.ReturnValue));
+
+        // Null object == null -> must return -1!
+        var snapNull = emulator.EmulateMethod(method, initialArgs: [null, 42]);
+        Assert.True(snapNull.CompletedNormally);
+        Assert.Equal(-1, Assert.IsType<int>(snapNull.ReturnValue));
     }
 
     // =========================================================================
@@ -238,11 +304,12 @@ public sealed class AdversarialAuditTests {
     // =========================================================================
 
     [Fact]
-    public void ComputedCallSiteOffsets_MissedByFindVerifiedCallSites() {
+    public void ComputedCallSiteOffsets_DiscoveredAndDevirtualizedWithDifferentialEquivalence() {
         string workDir = CreateTempDir("computed-callsite");
         try {
             string virtPath = Path.Combine(workDir, "Virt_Tier2.dll");
             string modPath = Path.Combine(workDir, "Virt_Tier2_ComputedOffsets.dll");
+            string devirtPath = Path.Combine(workDir, "Devirt_Tier2_ComputedOffsets.dll");
 
             var truth = new SyntheticVmCompiler().Generate(SyntheticTier.Tier2_32BitDictEncryptedPolymorphic, virtPath);
             var module = ModuleDefinition.FromFile(virtPath);
@@ -278,13 +345,16 @@ public sealed class AdversarialAuditTests {
 
             var metrics = new V2Devirtualizer().Devirtualize(reloaded);
 
-            // Handlers are still 100% discovered and classified
+            // Handlers are 100% discovered and classified
             Assert.Equal(truth.OpcodeMap.Count, metrics.HandlersDiscovered);
             Assert.Equal(truth.OpcodeMap.Count, metrics.HandlersClassified);
 
-            // FindVerifiedCallSites requires `insns[i - 1].IsLdcI4()`, so computed offsets yield 0 methods discovered!
-            Assert.Equal(0, metrics.MethodsDiscovered);
-            Assert.Equal(0, metrics.MethodsDevirtualized);
+            // Computed call-site offsets are evaluated structurally: 6/6 discovered & 6/6 devirtualized!
+            Assert.Equal(truth.VirtualizedMethods.Count, metrics.MethodsDiscovered);
+            Assert.Equal(truth.VirtualizedMethods.Count, metrics.MethodsDevirtualized);
+
+            reloaded.Write(devirtPath);
+            VerifyTier2DifferentialEquivalence(devirtPath);
         }
         finally {
             SafeDeleteDir(workDir);
@@ -292,19 +362,22 @@ public sealed class AdversarialAuditTests {
     }
 
     [Fact]
-    public void NonManifestResource_RenamedOrInCodeBytecode_FailsToExtractAndDevirtualize() {
+    public void NonManifestResource_RenamedResourceAndKeys_ExtractsAndDevirtualizesWithEquivalence() {
         string workDir = CreateTempDir("non-manifest-bytecode");
         try {
             string virtPath = Path.Combine(workDir, "Virt_Tier2.dll");
             string modPath = Path.Combine(workDir, "Virt_Tier2_NoVmBytecodeResource.dll");
+            string devirtPath = Path.Combine(workDir, "Devirt_Tier2_NoVmBytecodeResource.dll");
 
             var truth = new SyntheticVmCompiler().Generate(SyntheticTier.Tier2_32BitDictEncryptedPolymorphic, virtPath);
             var module = ModuleDefinition.FromFile(virtPath);
 
-            // Rename ManifestResource from hardcoded "VmBytecode" to an obfuscated name and clear FieldRva
+            // Rename ManifestResource from "VmBytecode" to an obfuscated name, rename KeySeed/KeyStep, and clear FieldRva
             var res = module.Resources.First(r => r.Name == "VmBytecode");
             res.Name = "EncryptedBlob_9F3A";
             var vmType = module.TopLevelTypes.First(t => t.Name == "VmRuntime");
+            vmType.Fields.First(f => f.Name == "KeySeed").Name = "k_a";
+            vmType.Fields.First(f => f.Name == "KeyStep").Name = "k_b";
             var blobField = vmType.Fields.First(f => f.Name == "BytecodeBlob");
             blobField.FieldRva = null;
             blobField.Attributes &= ~FieldAttributes.HasFieldRva;
@@ -316,14 +389,17 @@ public sealed class AdversarialAuditTests {
             var diags = new List<string>();
             var discovery = devirt.DiscoverVm(reloaded, diags);
 
-            // VM is discovered, but bytecode blob extraction returns empty array
+            // VM, obfuscated bytecode resource, and renamed rolling keys are all discovered structurally
             Assert.NotNull(discovery);
-            Assert.Empty(discovery!.BytecodeBlob);
+            Assert.NotEmpty(discovery!.BytecodeBlob);
 
             var metrics = devirt.Devirtualize(reloaded);
             Assert.Equal(truth.OpcodeMap.Count, metrics.HandlersClassified);
-            Assert.Equal(0, metrics.MethodsDevirtualized);
-            Assert.Contains(metrics.Diagnostics, d => d.Contains("invalid bytecode offset", StringComparison.OrdinalIgnoreCase));
+            Assert.Equal(truth.VirtualizedMethods.Count, metrics.MethodsDiscovered);
+            Assert.Equal(truth.VirtualizedMethods.Count, metrics.MethodsDevirtualized);
+
+            reloaded.Write(devirtPath);
+            VerifyTier2DifferentialEquivalence(devirtPath);
         }
         finally {
             SafeDeleteDir(workDir);
@@ -402,6 +478,86 @@ public sealed class AdversarialAuditTests {
                 flatAlc.Unload();
                 unflatAlc.Unload();
             }
+        }
+        finally {
+            SafeDeleteDir(workDir);
+        }
+    }
+
+    [Fact]
+    public void CffUnflattener_DynamicPredecessorFallthrough_PreservesDispatcherAndMatchesReference50Inputs() {
+        string workDir = CreateTempDir("cff-dynamic-fallthrough");
+        try {
+            static int ReferenceCompute(int a, int b) {
+                int acc = (a & 1) == 0 ? unchecked(a + b) : unchecked(a - b);
+                return unchecked(acc * 3);
+            }
+
+            var (module, method) = BuildDynamicFallthroughCffMethod();
+            string outPath = Path.Combine(workDir, "DynamicFallthroughCff.dll");
+
+            var unflattener = new CffUnflattener();
+            var cffResult = unflattener.Unflatten(method.CilMethodBody!);
+
+            // Constant back-edges from case0/case1 to case2 are rewired, leaving zero explicit branches to dispatcherStart.
+            // However, `state = a & 1` falls through directly into dispatcherStart, so the switch dispatcher MUST be preserved!
+            Assert.Equal(0, cffResult.SwitchesEliminated);
+            Assert.Contains(method.CilMethodBody!.Instructions, i => i.OpCode.Code == CilCode.Switch);
+
+            method.CilMethodBody.ComputeMaxStack();
+            module.Write(outPath);
+
+            var rng = new Random(20261125);
+            var inputs = new List<(int A, int B)> {
+                (0, 0), (1, 0), (2, 5), (3, 5), (-1, 10), (-2, 10), (int.MaxValue, -1), (int.MinValue, 1)
+            };
+            while (inputs.Count < 50)
+                inputs.Add((rng.Next(-100_000, 100_000), rng.Next(-100_000, 100_000)));
+
+            var alc = new CollectibleContext();
+            try {
+                var mi = alc.LoadFromAssemblyPath(outPath)
+                    .GetType("AdversarialFixture.DynamicFallthroughTarget", throwOnError: true)!
+                    .GetMethod("Compute", BindingFlags.Public | BindingFlags.Static)!;
+
+                foreach (var (a, b) in inputs) {
+                    int actual = (int)mi.Invoke(null, [a, b])!;
+                    Assert.Equal(ReferenceCompute(a, b), actual);
+                }
+            }
+            finally {
+                alc.Unload();
+            }
+        }
+        finally {
+            SafeDeleteDir(workDir);
+        }
+    }
+
+    [Fact]
+    public void V2Devirtualizer_TruncatedBytecodeStream_FailsClosedWithoutThrowing() {
+        string workDir = CreateTempDir("truncated-bytecode");
+        try {
+            string virtPath = Path.Combine(workDir, "Virt_Tier1.dll");
+            string modPath = Path.Combine(workDir, "Virt_Tier1_Truncated.dll");
+
+            var truth = new SyntheticVmCompiler().Generate(SyntheticTier.Tier1_Clean8BitTable, virtPath);
+            var module = ModuleDefinition.FromFile(virtPath);
+
+            // Truncate the embedded VmBytecode resource to 13 bytes (12-byte header + 1 partial byte)
+            var res = module.Resources.First(r => r.Name == "VmBytecode");
+            byte[] original = res.GetData()!;
+            byte[] truncated = original.Take(13).ToArray();
+            module.Resources.Remove(res);
+            module.Resources.Add(new ManifestResource("VmBytecode", AsmResolver.PE.DotNet.Metadata.Tables.ManifestResourceAttributes.Public, new DataSegment(truncated)));
+
+            module.Write(modPath);
+            var reloaded = ModuleDefinition.FromFile(modPath);
+
+            // Must NOT throw EndOfStreamException; must fail closed cleanly with diagnostics
+            var metrics = new V2Devirtualizer().Devirtualize(reloaded);
+            Assert.Equal(0, metrics.MethodsDevirtualized);
+            Assert.NotEmpty(metrics.Diagnostics);
         }
         finally {
             SafeDeleteDir(workDir);
@@ -782,6 +938,77 @@ public sealed class AdversarialAuditTests {
         return (module, method);
     }
 
+    private static (ModuleDefinition Module, MethodDefinition Method) BuildDynamicFallthroughCffMethod() {
+        var module = CreateFreshNet8Module("DynamicFallthroughCff");
+        var importer = module.DefaultImporter;
+        var int32 = module.CorLibTypeFactory.Int32;
+
+        var targetType = new TypeDefinition("AdversarialFixture", "DynamicFallthroughTarget",
+            TypeAttributes.Public | TypeAttributes.Abstract | TypeAttributes.Sealed,
+            importer.ImportType(typeof(object)));
+        module.TopLevelTypes.Add(targetType);
+
+        var method = new MethodDefinition("Compute",
+            MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig,
+            MethodSignature.CreateStatic(int32, [int32, int32]));
+        targetType.Methods.Add(method);
+
+        var body = new CilMethodBody { InitializeLocals = true };
+        var stateVar = new CilLocalVariable(int32);
+        var accVar = new CilLocalVariable(int32);
+        body.LocalVariables.Add(stateVar);
+        body.LocalVariables.Add(accVar);
+
+        var dispatcherStart = new CilInstruction(CilOpCodes.Ldloc, stateVar);
+        var case0 = new CilInstruction(CilOpCodes.Nop);
+        var case1 = new CilInstruction(CilOpCodes.Nop);
+        var case2 = new CilInstruction(CilOpCodes.Nop);
+
+        // Dynamic entry: state = a & 1; falls through directly into dispatcherStart!
+        body.Instructions.Add(CilOpCodes.Ldarg_0);
+        body.Instructions.Add(CilOpCodes.Ldc_I4_1);
+        body.Instructions.Add(CilOpCodes.And);
+        body.Instructions.Add(CilOpCodes.Stloc, stateVar);
+
+        // Dispatcher: ldloc state; switch (case0, case1, case2)
+        body.Instructions.Add(dispatcherStart);
+        body.Instructions.Add(CilOpCodes.Switch, new List<ICilLabel> {
+            case0.CreateLabel(), case1.CreateLabel(), case2.CreateLabel()
+        });
+        body.Instructions.Add(CilOpCodes.Ldc_I4_M1);
+        body.Instructions.Add(CilOpCodes.Ret);
+
+        // Case 0: acc = a + b; state = 2; br dispatcherStart
+        body.Instructions.Add(case0);
+        body.Instructions.Add(CilOpCodes.Ldarg_0);
+        body.Instructions.Add(CilOpCodes.Ldarg_1);
+        body.Instructions.Add(CilOpCodes.Add);
+        body.Instructions.Add(CilOpCodes.Stloc, accVar);
+        body.Instructions.Add(CilOpCodes.Ldc_I4_2);
+        body.Instructions.Add(CilOpCodes.Stloc, stateVar);
+        body.Instructions.Add(CilOpCodes.Br, dispatcherStart.CreateLabel());
+
+        // Case 1: acc = a - b; state = 2; br dispatcherStart
+        body.Instructions.Add(case1);
+        body.Instructions.Add(CilOpCodes.Ldarg_0);
+        body.Instructions.Add(CilOpCodes.Ldarg_1);
+        body.Instructions.Add(CilOpCodes.Sub);
+        body.Instructions.Add(CilOpCodes.Stloc, accVar);
+        body.Instructions.Add(CilOpCodes.Ldc_I4_2);
+        body.Instructions.Add(CilOpCodes.Stloc, stateVar);
+        body.Instructions.Add(CilOpCodes.Br, dispatcherStart.CreateLabel());
+
+        // Case 2: return acc * 3
+        body.Instructions.Add(case2);
+        body.Instructions.Add(CilOpCodes.Ldloc, accVar);
+        body.Instructions.Add(CilOpCodes.Ldc_I4_3);
+        body.Instructions.Add(CilOpCodes.Mul);
+        body.Instructions.Add(CilOpCodes.Ret);
+
+        method.CilMethodBody = body;
+        return (module, method);
+    }
+
     private static (TypeDefinition DelType, MethodDefinition DelCtor) CreateDelegateType(
         TypeDefinition vmType, ReferenceImporter importer, CorLibTypeFactory corlib) {
         var delType = new TypeDefinition("", "VmHandler",
@@ -813,6 +1040,218 @@ public sealed class AdversarialAuditTests {
                 new GenericParameterSignature(GenericParameterType.Type, 1)
             ]));
         return (field, dictCtor, dictAdd);
+    }
+
+    private static (ModuleDefinition Module, List<string> ExpectedHandlerNames) BuildReflectionMetadataTokenVmModule() {
+        var module = CreateFreshNet8Module("ReflectionTokenVm");
+        var importer = module.DefaultImporter;
+        var corlib = module.CorLibTypeFactory;
+
+        var vmType = new TypeDefinition("AdversarialVm", "GClass105", TypeAttributes.Public | TypeAttributes.Class,
+            importer.ImportType(typeof(object)));
+        module.TopLevelTypes.Add(vmType);
+
+        // Open instance delegate: public delegate void VmHandler(GClass105 instance);
+        var delType = new TypeDefinition("", "VmHandler",
+            TypeAttributes.NestedPublic | TypeAttributes.Sealed | TypeAttributes.Class,
+            importer.ImportType(typeof(MulticastDelegate)));
+        vmType.NestedTypes.Add(delType);
+
+        var delCtor = new MethodDefinition(".ctor",
+            MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.SpecialName | MethodAttributes.RuntimeSpecialName,
+            MethodSignature.CreateInstance(corlib.Void, [corlib.Object, corlib.IntPtr])) {
+            ImplAttributes = MethodImplAttributes.Runtime | MethodImplAttributes.Managed
+        };
+        var delInvoke = new MethodDefinition("Invoke",
+            MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.NewSlot | MethodAttributes.Virtual,
+            MethodSignature.CreateInstance(corlib.Void, [vmType.ToTypeSignature()])) {
+            ImplAttributes = MethodImplAttributes.Runtime | MethodImplAttributes.Managed
+        };
+        delType.Methods.Add(delCtor);
+        delType.Methods.Add(delInvoke);
+
+        // Static Dictionary<uint, VmHandler> dictionary_0
+        var dictOpen = importer.ImportType(typeof(Dictionary<,>));
+        var dictSig = new GenericInstanceTypeSignature(dictOpen, isValueType: false, [corlib.UInt32, delType.ToTypeSignature()]);
+        var dictField = new FieldDefinition("dictionary_0", FieldAttributes.Private | FieldAttributes.Static, new FieldSignature(dictSig));
+        vmType.Fields.Add(dictField);
+
+        var dictTypeSpec = new TypeSpecification(dictSig);
+        var dictCtor = new MemberReference(dictTypeSpec, ".ctor", MethodSignature.CreateInstance(corlib.Void));
+        var dictSetItem = new MemberReference(dictTypeSpec, "set_Item",
+            MethodSignature.CreateInstance(corlib.Void, [
+                new GenericParameterSignature(GenericParameterType.Type, 0),
+                new GenericParameterSignature(GenericParameterType.Type, 1)
+            ]));
+
+        // Add 6 private instance handler methods matching VmHandler (void ())
+        var expectedHandlerNames = new List<string>();
+        for (int i = 0; i < 6; i++) {
+            string name = $"method_{i}";
+            var hm = new MethodDefinition(name, MethodAttributes.Private | MethodAttributes.HideBySig,
+                MethodSignature.CreateInstance(corlib.Void));
+            var hb = new CilMethodBody();
+            hb.Instructions.Add(CilOpCodes.Ret);
+            hm.CilMethodBody = hb;
+            vmType.Methods.Add(hm);
+            expectedHandlerNames.Add(name);
+        }
+
+        // Add non-matching private instance helper methods that Delegate.CreateDelegate(..., false) MUST skip
+        var nonMatchingHelper1 = new MethodDefinition("helper_read", MethodAttributes.Private | MethodAttributes.HideBySig,
+            MethodSignature.CreateInstance(corlib.Int32));
+        var nh1 = new CilMethodBody();
+        nh1.Instructions.Add(CilOpCodes.Ldc_I4_0);
+        nh1.Instructions.Add(CilOpCodes.Ret);
+        nonMatchingHelper1.CilMethodBody = nh1;
+        vmType.Methods.Add(nonMatchingHelper1);
+
+        var nonMatchingHelper2 = new MethodDefinition("helper_push", MethodAttributes.Private | MethodAttributes.HideBySig,
+            MethodSignature.CreateInstance(corlib.Void, [corlib.Int32]));
+        var nh2 = new CilMethodBody();
+        nh2.Instructions.Add(CilOpCodes.Ret);
+        nonMatchingHelper2.CilMethodBody = nh2;
+        vmType.Methods.Add(nonMatchingHelper2);
+
+        // Public VM entry method so DiscoverVm recognizes GClass105 as a VM type
+        var entry = new MethodDefinition("Execute_0", MethodAttributes.Public | MethodAttributes.HideBySig,
+            MethodSignature.CreateInstance(corlib.Object, [corlib.Object.MakeSzArrayType(), corlib.Int32]));
+        var eb = new CilMethodBody();
+        eb.Instructions.Add(CilOpCodes.Ldnull);
+        eb.Instructions.Add(CilOpCodes.Ret);
+        entry.CilMethodBody = eb;
+        vmType.Methods.Add(entry);
+
+        // GClass105::.cctor mirroring reflection MetadataToken registration loop:
+        //   dictionary_0 = new Dictionary<uint, VmHandler>();
+        //   MethodInfo[] methods = typeof(GClass105).GetMethods(BindingFlags.DeclaredOnly | BindingFlags.Instance | BindingFlags.NonPublic);
+        //   for (int i = 0; i < methods.Length; i++) {
+        //       Delegate del = Delegate.CreateDelegate(typeof(VmHandler), methods[i], false);
+        //       if (del != null)
+        //           dictionary_0[(uint)methods[i].MetadataToken] = (VmHandler)del;
+        //   }
+        var typeGetFromHandle = importer.ImportMethod(typeof(Type).GetMethod(nameof(Type.GetTypeFromHandle), [typeof(RuntimeTypeHandle)])!);
+        var typeGetMethods = importer.ImportMethod(typeof(Type).GetMethod(nameof(Type.GetMethods), [typeof(BindingFlags)])!);
+        var delCreate = importer.ImportMethod(typeof(Delegate).GetMethod(nameof(Delegate.CreateDelegate), [typeof(Type), typeof(MethodInfo), typeof(bool)])!);
+        var getMetadataToken = importer.ImportMethod(typeof(MemberInfo).GetProperty(nameof(MemberInfo.MetadataToken))!.GetMethod!);
+        var methodInfoArrSig = importer.ImportTypeSignature(typeof(MethodInfo[]));
+        var methodInfoSig = importer.ImportTypeSignature(typeof(MethodInfo));
+        var delegateSig = importer.ImportTypeSignature(typeof(Delegate));
+
+        var cctor = new MethodDefinition(".cctor",
+            MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig | MethodAttributes.SpecialName | MethodAttributes.RuntimeSpecialName,
+            MethodSignature.CreateStatic(corlib.Void));
+        vmType.Methods.Add(cctor);
+
+        var cb = new CilMethodBody { InitializeLocals = true };
+        var methodsLoc = new CilLocalVariable(methodInfoArrSig);
+        var idxLoc = new CilLocalVariable(corlib.Int32);
+        var curMiLoc = new CilLocalVariable(methodInfoSig);
+        var delLoc = new CilLocalVariable(delegateSig);
+        cb.LocalVariables.Add(methodsLoc);
+        cb.LocalVariables.Add(idxLoc);
+        cb.LocalVariables.Add(curMiLoc);
+        cb.LocalVariables.Add(delLoc);
+
+        var loopCheck = new CilInstruction(CilOpCodes.Ldloc, idxLoc);
+        var loopBody = new CilInstruction(CilOpCodes.Ldloc, methodsLoc);
+        var loopNext = new CilInstruction(CilOpCodes.Ldloc, idxLoc);
+
+        cb.Instructions.Add(CilOpCodes.Newobj, dictCtor);
+        cb.Instructions.Add(CilOpCodes.Stsfld, dictField);
+
+        cb.Instructions.Add(CilOpCodes.Ldtoken, vmType);
+        cb.Instructions.Add(CilOpCodes.Call, typeGetFromHandle);
+        cb.Instructions.Add(CilOpCodes.Ldc_I4, (int)(BindingFlags.DeclaredOnly | BindingFlags.Instance | BindingFlags.NonPublic));
+        cb.Instructions.Add(CilOpCodes.Callvirt, typeGetMethods);
+        cb.Instructions.Add(CilOpCodes.Stloc, methodsLoc);
+
+        cb.Instructions.Add(CilOpCodes.Ldc_I4_0);
+        cb.Instructions.Add(CilOpCodes.Stloc, idxLoc);
+        cb.Instructions.Add(CilOpCodes.Br, loopCheck.CreateLabel());
+
+        // Loop body
+        cb.Instructions.Add(loopBody);
+        cb.Instructions.Add(CilOpCodes.Ldloc, idxLoc);
+        cb.Instructions.Add(CilOpCodes.Ldelem_Ref);
+        cb.Instructions.Add(CilOpCodes.Stloc, curMiLoc);
+
+        cb.Instructions.Add(CilOpCodes.Ldtoken, delType);
+        cb.Instructions.Add(CilOpCodes.Call, typeGetFromHandle);
+        cb.Instructions.Add(CilOpCodes.Ldloc, curMiLoc);
+        cb.Instructions.Add(CilOpCodes.Ldc_I4_0);
+        cb.Instructions.Add(CilOpCodes.Call, delCreate);
+        cb.Instructions.Add(CilOpCodes.Stloc, delLoc);
+
+        cb.Instructions.Add(CilOpCodes.Ldloc, delLoc);
+        cb.Instructions.Add(CilOpCodes.Brfalse, loopNext.CreateLabel());
+
+        cb.Instructions.Add(CilOpCodes.Ldsfld, dictField);
+        cb.Instructions.Add(CilOpCodes.Ldloc, curMiLoc);
+        cb.Instructions.Add(CilOpCodes.Callvirt, getMetadataToken);
+        cb.Instructions.Add(CilOpCodes.Ldloc, delLoc);
+        cb.Instructions.Add(CilOpCodes.Castclass, delType);
+        cb.Instructions.Add(CilOpCodes.Callvirt, dictSetItem);
+
+        // i++
+        cb.Instructions.Add(loopNext);
+        cb.Instructions.Add(CilOpCodes.Ldc_I4_1);
+        cb.Instructions.Add(CilOpCodes.Add);
+        cb.Instructions.Add(CilOpCodes.Stloc, idxLoc);
+
+        // i < methods.Length
+        cb.Instructions.Add(loopCheck);
+        cb.Instructions.Add(CilOpCodes.Ldloc, methodsLoc);
+        cb.Instructions.Add(CilOpCodes.Ldlen);
+        cb.Instructions.Add(CilOpCodes.Conv_I4);
+        cb.Instructions.Add(CilOpCodes.Blt, loopBody.CreateLabel());
+
+        cb.Instructions.Add(CilOpCodes.Ret);
+        cctor.CilMethodBody = cb;
+
+        return (module, expectedHandlerNames);
+    }
+
+    private static void VerifyTier2DifferentialEquivalence(string devirtPath) {
+        var alc = new CollectibleContext();
+        try {
+            var asm = alc.LoadFromAssemblyPath(devirtPath);
+            var targetType = asm.GetType("SyntheticFixture.VirtualizedTargets", throwOnError: true)!;
+            var rng = new Random(20261125);
+
+            var addSubMul = targetType.GetMethod(nameof(ReferenceSuite.AddSubMul))!;
+            for (int i = 0; i < 30; i++) {
+                int a = rng.Next(-10_000, 10_000), b = rng.Next(-10_000, 10_000);
+                Assert.Equal(ReferenceSuite.AddSubMul(a, b), (int)addSubMul.Invoke(null, [a, b])!);
+            }
+
+            var xorShift = targetType.GetMethod(nameof(ReferenceSuite.XorShiftMix))!;
+            for (int i = 0; i < 30; i++) {
+                int x = rng.Next(-100_000, 100_000), y = rng.Next(-100_000, 100_000);
+                Assert.Equal(ReferenceSuite.XorShiftMix(x, y), (int)xorShift.Invoke(null, [x, y])!);
+            }
+
+            var clamp = targetType.GetMethod(nameof(ReferenceSuite.Clamp))!;
+            for (int i = 0; i < 20; i++) {
+                int min = rng.Next(-500, 500), max = min + rng.Next(0, 500), v = rng.Next(-1000, 1000);
+                Assert.Equal(ReferenceSuite.Clamp(v, min, max), (int)clamp.Invoke(null, [v, min, max])!);
+            }
+
+            var sumRange = targetType.GetMethod(nameof(ReferenceSuite.SumRange))!;
+            foreach (int n in new[] { -5, 0, 1, 10, 50 })
+                Assert.Equal(ReferenceSuite.SumRange(n), (int)sumRange.Invoke(null, [n])!);
+
+            var gcd = targetType.GetMethod(nameof(ReferenceSuite.Gcd))!;
+            foreach (var (a, b) in new[] { (0, 0), (48, 18), (-48, 18), (1071, 462), (17, 13) })
+                Assert.Equal(ReferenceSuite.Gcd(a, b), (int)gcd.Invoke(null, [a, b])!);
+
+            var classify = targetType.GetMethod(nameof(ReferenceSuite.ClassifyScore))!;
+            foreach (int s in new[] { -1, 0, 49, 50, 79, 80, 100 })
+                Assert.Equal(ReferenceSuite.ClassifyScore(s), (int)classify.Invoke(null, [s])!);
+        }
+        finally {
+            alc.Unload();
+        }
     }
 
     private static string CreateTempDir(string tag) {

@@ -2,7 +2,6 @@ using AsmResolver;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Serialized;
 using AsmResolver.PE.File;
-using AsmResolver.PE.File.Headers;
 using de4vmp.Core.Architecture;
 using de4vmp.Core.Services;
 using de4vmp.Core.Translation.Resolution;

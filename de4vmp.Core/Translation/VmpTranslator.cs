@@ -1,9 +1,7 @@
 ﻿using AsmResolver.DotNet;
 using AsmResolver.DotNet.Signatures;
-using AsmResolver.DotNet.Signatures.Types;
 using AsmResolver.IO;
 using AsmResolver.PE.DotNet.Metadata.Tables;
-using AsmResolver.PE.DotNet.Metadata.Tables.Rows;
 using de4vmp.Core.Architecture;
 using de4vmp.Core.DataFlow;
 using de4vmp.Core.DataFlow.Blocks;
@@ -40,7 +38,7 @@ public class VmpTranslator {
         var signatures = new TypeSignature[binaryReader.ReadInt16()];
         for (int i = signatures.Length - 1; i >= 0; i--)
             signatures[i] = ResolveMember<ITypeDescriptor>(binaryReader.ReadInt32())
-                .ToTypeSignature();
+                .ToTypeSignature(_context.Module.RuntimeContext);
 
         int returnTypeToken = binaryReader.ReadInt32();
         uint functionAddress = binaryReader.Rva;
@@ -50,7 +48,7 @@ public class VmpTranslator {
 
         var returnType = returnTypeToken is 0
             ? _context.Module.CorLibTypeFactory.Void
-            : ResolveMember<ITypeDescriptor>(returnTypeToken).ToTypeSignature();
+            : ResolveMember<ITypeDescriptor>(returnTypeToken).ToTypeSignature(_context.Module.RuntimeContext);
 
         string methodName = $"EXPORT_{(isStatic ? "STATIC" : "INSTANCE")}_{functionAddress:X}";
         var methodSignature = new MethodSignature(CallingConventionAttributes.Default, returnType, signatures);

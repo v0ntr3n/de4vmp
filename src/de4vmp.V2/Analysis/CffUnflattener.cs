@@ -39,8 +39,9 @@ public sealed class CffUnflattener {
             }
 
             // 2. Fold constant-expression switch dispatchers
-            if (TryUnflattenOneDispatcher(insns)) {
-                switchesEliminated++;
+            if (TryUnflattenOneDispatcher(insns, out bool switchEliminated)) {
+                if (switchEliminated)
+                    switchesEliminated++;
                 changed = true;
             }
 
@@ -108,7 +109,8 @@ public sealed class CffUnflattener {
         return modified;
     }
 
-    private static bool TryUnflattenOneDispatcher(CilInstructionCollection insns) {
+    private static bool TryUnflattenOneDispatcher(CilInstructionCollection insns, out bool switchEliminated) {
+        switchEliminated = false;
         // Locate a switch instruction fed by a state local:
         //   ldloc S [; ldc.i4 K; (xor|rem|rem.un|and)] ; switch (targets...)
         int switchIdx = -1;
@@ -151,33 +153,50 @@ public sealed class CffUnflattener {
         if (switchIdx < 0 || stateVar is null || insns[switchIdx].Operand is not IList<ICilLabel> rawTargets || rawTargets.Count == 0)
             return false;
 
-        var targets = rawTargets.Select(t => ResolveTargetIndex(insns, t)).ToArray();
-        if (targets.Any(t => t < 0))
+        var targetIndices = rawTargets.Select(t => ResolveTargetIndex(insns, t)).ToArray();
+        if (targetIndices.Any(t => t < 0))
             return false;
-
-        var dispatcherLabel = insns[dispatcherStart];
+        var targetInsns = targetIndices.Select(t => insns[t]).ToArray();
 
         // Find all assignments to stateVar that branch back to dispatcherStart (or fall through into dispatcherStart)
         int rewired = 0;
 
-        // Pattern A: `ldc.i4 NEXT; stloc S; br dispatcherStart` (or fallthrough into dispatcherStart)
+        // Pattern A: `ldc.i4 NEXT; stloc S; [pure straight-line setup;] (br dispatcherStart | fallthrough into dispatcherStart)`
         for (int i = 0; i < insns.Count; i++) {
             if (insns[i].OpCode.Code != CilCode.Stloc || !Equals(insns[i].Operand, stateVar))
                 continue;
 
-            // Check if the next instruction jumps to dispatcherStart OR is dispatcherStart itself
-            int nextIdx = SkipNops(insns, i + 1);
+            // Scan forward from i + 1 across nops and optional straight-line instructions that do not touch stateVar
+            int scan = i + 1;
+            int nonNopIntervening = 0;
             bool goesToDispatcher = false;
             int jumpIdx = -1;
 
-            if (nextIdx == dispatcherStart) {
-                goesToDispatcher = true;
-            }
-            else if (nextIdx < insns.Count && insns[nextIdx].OpCode.Code == CilCode.Br &&
-                     insns[nextIdx].Operand is ICilLabel lbl &&
-                     ResolveTargetIndex(insns, lbl) == dispatcherStart) {
-                goesToDispatcher = true;
-                jumpIdx = nextIdx;
+            while (scan < insns.Count && nonNopIntervening <= 8) {
+                if (scan == dispatcherStart) {
+                    goesToDispatcher = true;
+                    break;
+                }
+                var cur = insns[scan];
+                if (cur.OpCode.Code == CilCode.Nop) {
+                    scan++;
+                    continue;
+                }
+                if (cur.OpCode.Code == CilCode.Br &&
+                    cur.Operand is ICilLabel lbl &&
+                    ResolveTargetIndex(insns, lbl) == dispatcherStart) {
+                    goesToDispatcher = true;
+                    jumpIdx = scan;
+                    break;
+                }
+                // Allow intervening straight-line instructions that do not read/write stateVar or branch
+                if (cur.OpCode.FlowControl == CilFlowControl.Next &&
+                    !(cur.OpCode.Code is CilCode.Ldloc or CilCode.Stloc or CilCode.Ldloca && Equals(cur.Operand, stateVar))) {
+                    nonNopIntervening++;
+                    scan++;
+                    continue;
+                }
+                break;
             }
 
             if (!goesToDispatcher)
@@ -187,13 +206,18 @@ public sealed class CffUnflattener {
             if (!TryEvalConstantBackward(insns, i - 1, out int nextState, out int exprStart))
                 continue;
 
-            int caseIndex = indexTransform(nextState);
-            if (caseIndex < 0 || caseIndex >= targets.Length)
+            // Guard against corrupting mid-sequence jump targets in [exprStart+1 .. scan-1] (and jumpIdx if present)
+            int guardEnd = jumpIdx >= 0 ? jumpIdx : scan - 1;
+            if (guardEnd >= exprStart + 1 && HasBranchTargetInRange(insns, exprStart + 1, guardEnd, -1))
                 continue;
 
-            var targetInsn = insns[targets[caseIndex]];
+            int caseIndex = indexTransform(nextState);
+            if (caseIndex < 0 || caseIndex >= targetInsns.Length)
+                continue;
 
-            // Rewrite: nop out the constant + stloc, replace branch (or stloc) with direct `br targetInsn`
+            var targetInsn = targetInsns[caseIndex];
+
+            // Rewrite: nop out the constant expression feeding stateVar
             for (int k = exprStart; k < i; k++) {
                 insns[k].OpCode = CilOpCodes.Nop;
                 insns[k].Operand = null;
@@ -205,9 +229,18 @@ public sealed class CffUnflattener {
                 insns[jumpIdx].OpCode = CilOpCodes.Br;
                 insns[jumpIdx].Operand = targetInsn.CreateLabel();
             }
-            else {
+            else if (nonNopIntervening == 0) {
                 insns[i].OpCode = CilOpCodes.Br;
                 insns[i].Operand = targetInsn.CreateLabel();
+            }
+            else {
+                // Preserve intervening setup instructions (e.g. initializing another local) and jump directly
+                // to targetInsn right before dispatcherStart so control never falls through into the switch.
+                insns[i].OpCode = CilOpCodes.Nop;
+                insns[i].Operand = null;
+                insns.Insert(dispatcherStart, new CilInstruction(CilOpCodes.Br, targetInsn.CreateLabel()));
+                dispatcherStart++;
+                switchIdx++;
             }
 
             rewired++;
@@ -216,18 +249,42 @@ public sealed class CffUnflattener {
         if (rewired == 0)
             return false;
 
-        // Check if any remaining branch still targets dispatcherStart; if none, nop out the dispatcher!
-        bool dispatcherStillReferenced = false;
-        for (int i = 0; i < insns.Count; i++) {
-            if (i >= dispatcherStart && i <= switchIdx)
-                continue;
-            if (insns[i].Operand is ICilLabel l && ResolveTargetIndex(insns, l) == dispatcherStart) {
+        // Check if control can fall through into dispatcherStart OR if any remaining branch targets dispatcherStart..switchIdx.
+        // If either is true, the dispatcher MUST NOT be deleted.
+        bool dispatcherStillReferenced = dispatcherStart == 0;
+        if (!dispatcherStillReferenced) {
+            int prevIdx = dispatcherStart - 1;
+            while (prevIdx >= 0 && insns[prevIdx].OpCode.Code == CilCode.Nop)
+                prevIdx--;
+            if (prevIdx < 0) {
                 dispatcherStillReferenced = true;
-                break;
             }
-            if (insns[i].Operand is IList<ICilLabel> list && list.Any(l2 => ResolveTargetIndex(insns, l2) == dispatcherStart)) {
-                dispatcherStillReferenced = true;
-                break;
+            else {
+                var prevFlow = insns[prevIdx].OpCode.FlowControl;
+                if (prevFlow is CilFlowControl.Next or CilFlowControl.Call or CilFlowControl.ConditionalBranch or CilFlowControl.Break or CilFlowControl.Meta) {
+                    dispatcherStillReferenced = true;
+                }
+            }
+        }
+
+        if (!dispatcherStillReferenced) {
+            for (int i = 0; i < insns.Count; i++) {
+                if (i >= dispatcherStart && i <= switchIdx)
+                    continue;
+                if (insns[i].Operand is ICilLabel l) {
+                    int t = ResolveTargetIndex(insns, l);
+                    if (t >= dispatcherStart && t <= switchIdx) {
+                        dispatcherStillReferenced = true;
+                        break;
+                    }
+                }
+                if (insns[i].Operand is IList<ICilLabel> list && list.Any(l2 => {
+                    int t = ResolveTargetIndex(insns, l2);
+                    return t >= dispatcherStart && t <= switchIdx;
+                })) {
+                    dispatcherStillReferenced = true;
+                    break;
+                }
             }
         }
 
@@ -236,9 +293,28 @@ public sealed class CffUnflattener {
                 insns[k].OpCode = CilOpCodes.Nop;
                 insns[k].Operand = null;
             }
+            switchEliminated = true;
         }
 
         return true;
+    }
+
+    private static bool HasBranchTargetInRange(CilInstructionCollection insns, int rangeStart, int rangeEnd, int extraIdx) {
+        for (int i = 0; i < insns.Count; i++) {
+            if (insns[i].Operand is ICilLabel l) {
+                int t = ResolveTargetIndex(insns, l);
+                if ((t >= rangeStart && t <= rangeEnd) || (extraIdx >= 0 && t == extraIdx))
+                    return true;
+            }
+            else if (insns[i].Operand is IList<ICilLabel> list) {
+                foreach (var l2 in list) {
+                    int t = ResolveTargetIndex(insns, l2);
+                    if ((t >= rangeStart && t <= rangeEnd) || (extraIdx >= 0 && t == extraIdx))
+                        return true;
+                }
+            }
+        }
+        return false;
     }
 
     /// <summary>

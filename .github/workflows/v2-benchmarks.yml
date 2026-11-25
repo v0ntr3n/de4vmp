@@ -32,6 +32,14 @@ jobs:
         shell: pwsh
         run: dotnet restore tests/de4vmp.V2.Tests/de4vmp.V2.Tests.csproj
 
-      - name: Run V2 synthetic benchmark & fail-closed verification tests
+      - name: Install dotnet-ilverify
         shell: pwsh
+        run: |
+          dotnet tool install -g dotnet-ilverify
+          "$HOME/.dotnet/tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Run V2 synthetic benchmark, adversarial & ILVerify tests
+        shell: pwsh
+        env:
+          DE4VMP_REQUIRE_ILVERIFY: "1"
         run: dotnet test tests/de4vmp.V2.Tests/de4vmp.V2.Tests.csproj -c Release --no-restore --verbosity normal

@@ -1,4 +1,4 @@
-﻿using AsmResolver.DotNet.Signatures.Types;
+﻿using AsmResolver.DotNet.Signatures;
 
 namespace de4vmp.Core.Architecture.Annotations.Variables;
 

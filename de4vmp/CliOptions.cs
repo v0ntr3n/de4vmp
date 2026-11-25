@@ -8,9 +8,16 @@ internal static class ExitCodes {
     public const int Timeout = 124;
 }
 
+internal enum EngineMode {
+    Auto,
+    V1,
+    V2
+}
+
 internal sealed class CliOptions {
     public string? InputPath { get; init; }
     public string? OutputPath { get; init; }
+    public EngineMode Engine { get; init; } = EngineMode.Auto;
     public bool NonInteractive { get; init; }
     public bool NoBanner { get; init; }
     public bool ShowHelp { get; init; }
@@ -20,6 +27,7 @@ internal sealed class CliOptions {
     public static bool TryParse(string[] args, out CliOptions options, out string? error) {
         string? inputPath = null;
         string? outputPath = null;
+        EngineMode engine = EngineMode.Auto;
         bool nonInteractive = IsCiEnvironment();
         bool noBanner = false;
         bool showHelp = false;
@@ -96,6 +104,31 @@ internal sealed class CliOptions {
                     timeout = seconds == 0 ? null : TimeSpan.FromSeconds(seconds);
                     break;
 
+                case "--engine":
+                    if (i + 1 >= args.Length) {
+                        options = new CliOptions { NonInteractive = nonInteractive };
+                        error = $"Missing value for {arg}.";
+                        return false;
+                    }
+
+                    string rawEngine = args[++i];
+                    if (string.Equals(rawEngine, "auto", StringComparison.OrdinalIgnoreCase)) {
+                        engine = EngineMode.Auto;
+                    }
+                    else if (string.Equals(rawEngine, "v1", StringComparison.OrdinalIgnoreCase)) {
+                        engine = EngineMode.V1;
+                    }
+                    else if (string.Equals(rawEngine, "v2", StringComparison.OrdinalIgnoreCase)) {
+                        engine = EngineMode.V2;
+                    }
+                    else {
+                        options = new CliOptions { NonInteractive = nonInteractive };
+                        error = $"Invalid engine '{rawEngine}'. Expected one of: auto, v1, v2.";
+                        return false;
+                    }
+
+                    break;
+
                 default:
                     if (arg.StartsWith("-", StringComparison.Ordinal)) {
                         options = new CliOptions { NonInteractive = nonInteractive };
@@ -117,6 +150,7 @@ internal sealed class CliOptions {
         options = new CliOptions {
             InputPath = inputPath,
             OutputPath = outputPath,
+            Engine = engine,
             NonInteractive = nonInteractive,
             NoBanner = noBanner,
             ShowHelp = showHelp,
@@ -147,6 +181,7 @@ internal sealed class CliOptions {
         Options:
           -i, --input <path>        Path to the target .NET PE file to devirtualize.
           -o, --output <path>       Optional output file path (default: <name>_devirtualized<ext>).
+              --engine <auto|v1|v2> Devirtualization engine to use (default: auto).
           -t, --timeout <seconds>   Maximum execution time in seconds (0 disables timeout).
                                     Can also be set via DE4VMP_TIMEOUT_SECONDS.
               --ci, --non-interactive
